@@ -1,4 +1,3 @@
-fgi_engine.py: |
   import random
   from dataclasses import dataclass, asdict
   from typing import List, Dict, Set, Tuple
