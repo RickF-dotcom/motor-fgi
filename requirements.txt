@@ -1,0 +1,4 @@
+name: requirements.txt
+content: |
+  fastapi
+  uvicorn
