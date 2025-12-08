@@ -1,144 +1,195 @@
-# grupo_de_milhoes.py
+# fgi_engine.py
 #
-# Responsável por:
-# - gerar o universo total de combinações (25C15)
-# - manter o "grupo de milhões" em disco (grupo_de_milhoes.pkl)
-# - remover concursos já sorteados desse universo
-# - entregar amostras de jogos para o FGIMotor
+# Motor FGI operando sobre:
+# - histórico real de concursos
+# - grupo de milhões (combinações que AINDA NÃO saíram)
+#
+# AUTO:
+# - carrega/grava grupo_de_milhoes.pkl
+# - toda vez que /carregar recebe concursos,
+#   essas combinações são removidas automaticamente
+#   do grupo de milhões.
 
-from itertools import combinations
-from typing import Iterable, List
-import os
-import pickle
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+from collections import Counter
 import random
 
+from grupo_de_milhoes import GrupoDeMilhoes
 
-ARQUIVO_PADRAO = "grupo_de_milhoes.pkl"
+
+DEZENAS = list(range(1, 26))
 
 
-class GrupoDeMilhoes:
-    def __init__(self, arquivo: str = ARQUIVO_PADRAO, auto_generate: bool = True):
-        self.arquivo = arquivo
-        self.combos: List[int] = []
+@dataclass
+class AnaliseEstado:
+    total_concursos: int
+    freq: Dict[int, int]
+    frias: List[int]
+    quentes: List[int]
 
-        if os.path.exists(self.arquivo):
-            self._load()
-        else:
-            if auto_generate:
-                # Gera o universo total logo na primeira vez
-                self._gerar_universo_total()
-            else:
-                self.combos = []
+
+class FGIMotor:
+    def __init__(self) -> None:
+        # histórico + estatísticas
+        self.total_concursos: int = 0
+        self.freq: Counter[int] = Counter()
+        self.frias: List[int] = []
+        self.quentes: List[int] = []
+        self.historico: List[List[int]] = []
+
+        # grupo de milhões (AUTO)
+        self.grupo = GrupoDeMilhoes(auto_generate=True)
 
     # ----------------------------------------
-    # Codificação: jogo -> bitmask (25 bits)
+    # Utilidades internas
     # ----------------------------------------
     @staticmethod
-    def _encode(jogo: Iterable[int]) -> int:
-        mask = 0
-        for d in jogo:
-            if not 1 <= d <= 25:
-                raise ValueError(f"Dezena inválida: {d}")
-            mask |= 1 << (d - 1)
-        return mask
+    def _normalizar_jogo(jogo: List[int]) -> List[int]:
+        """Ordena, remove duplicadas e faz validação básica."""
+        dezenas = sorted(set(int(d) for d in jogo))
+        if len(dezenas) != 15:
+            raise ValueError(f"Jogo inválido (precisa de 15 dezenas distintas): {jogo}")
+        for d in dezenas:
+            if d not in DEZENAS:
+                raise ValueError(f"Dezena fora de [1,25]: {d}")
+        return dezenas
 
-    @staticmethod
-    def _decode(mask: int) -> List[int]:
-        return [d + 1 for d in range(25) if mask & (1 << d)]
+    def _recalcular_frias_quentes(self) -> None:
+        """Recalcula listas de frias e quentes a partir da frequência."""
+        # garante todas as dezenas no dicionário
+        freq_completa = {d: self.freq.get(d, 0) for d in DEZENAS}
+
+        ordenados = sorted(freq_completa.items(), key=lambda x: x[1])
+        # aqui é uma escolha de projeto: 8 frias / 8 quentes
+        n = 8
+        self.frias = [d for d, _ in ordenados[:n]]
+        self.quentes = [d for d, _ in ordenados[-n:]]
+
+    def _score_jogo(self, jogo: List[int]) -> float:
+        """
+        Score simples:
+        - soma das frequências históricas
+        - peso extra se usa quentes e frias
+        """
+        base = sum(self.freq.get(d, 0) for d in jogo)
+        qtd_quentes = sum(1 for d in jogo if d in self.quentes)
+        qtd_frias = sum(1 for d in jogo if d in self.frias)
+        return base + 2.0 * qtd_quentes + 1.5 * qtd_frias
 
     # ----------------------------------------
-    # Persistência
+    # API interna usada pelo FastAPI
     # ----------------------------------------
-    def _save(self) -> None:
-        with open(self.arquivo, "wb") as f:
-            pickle.dump(self.combos, f, protocol=pickle.HIGHEST_PROTOCOL)
+    def reset(self) -> None:
+        self.total_concursos = 0
+        self.freq = Counter()
+        self.frias = []
+        self.quentes = []
+        self.historico = []
 
-    def _load(self) -> None:
-        with open(self.arquivo, "rb") as f:
-            self.combos = pickle.load(f)
-
-    # ----------------------------------------
-    # Universo total e remoção das sorteadas
-    # ----------------------------------------
-    def _gerar_universo_total(self) -> None:
+    def carregar(self, concursos: List[List[int]]) -> Dict:
         """
-        Gera TODAS as combinações de 15 dezenas entre 1..25.
-        Tamanho: 3.268.760 combinações.
-        Roda uma vez, salva em grupo_de_milhoes.pkl.
+        Recebe uma janela de concursos (lista de jogos)
+        atualiza estatísticas e remove essas combinações
+        do grupo de milhões.
         """
-        combos: List[int] = []
-        for comb in combinations(range(1, 26), 15):
-            combos.append(self._encode(comb))
+        if not concursos:
+            return self.resumo_basico()
 
-        self.combos = combos
-        self._save()
-
-    def remover_sorteadas(self, concursos: List[List[int]]) -> None:
-        """
-        Remove do grupo todas as combinações que já saíram.
-        Pode ser chamado várias vezes (incremental).
-        """
-        if not self.combos:
-            return
-
-        base = set(self.combos)
-        alterou = False
-
+        normalizados: List[List[int]] = []
         for jogo in concursos:
-            mask = self._encode(jogo)
-            if mask in base:
-                base.remove(mask)
-                alterou = True
+            dezenas = self._normalizar_jogo(jogo)
+            normalizados.append(dezenas)
 
-        if alterou:
-            self.combos = list(base)
-            self._save()
+        # histórico + freq
+        self.historico.extend(normalizados)
+        self.total_concursos += len(normalizados)
+        for dezenas in normalizados:
+            self.freq.update(dezenas)
+
+        # frias/quentes
+        self._recalcular_frias_quentes()
+
+        # AUTO: remove essas combinações do grupo de milhões
+        try:
+            self.grupo.remover_sorteadas(normalizados)
+        except Exception:
+            # não quebra a API se der algum problema no grupo
+            pass
+
+        return self.resumo_basico()
+
+    def resumo_basico(self) -> Dict:
+        return {
+            "total_concursos": self.total_concursos,
+            "freq": {d: self.freq.get(d, 0) for d in DEZENAS},
+            "frias": self.frias,
+            "quentes": self.quentes,
+        }
 
     # ----------------------------------------
-    # Amostragem para o motor
+    # Geração de FGIs "finos"
     # ----------------------------------------
-    def sample(self, n: int) -> List[List[int]]:
+    def gerar_fgi_fino(
+        self,
+        n_resultados: int = 32,
+        min_frias: int = 5,
+        min_quentes: int = 4,
+    ) -> List[Tuple[float, List[int]]]:
         """
-        Retorna n jogos distintos do grupo (em forma de listas de dezenas).
+        Gera N jogos candidatos a partir do grupo de milhões,
+        filtrando por quentes/frias e ordenando pelo score.
         """
-        if not self.combos:
+
+        if n_resultados <= 0:
             return []
 
-        n = min(n, len(self.combos))
-        indices = random.sample(range(len(self.combos)), n)
-        return [self._decode(self.combos[i]) for i in indices]
+        # se o grupo tiver vazio, não tem o que fazer
+        if not self.grupo.combos:
+            raise RuntimeError("Grupo de milhões vazio. Gere/atualize primeiro.")
 
+        resultados: List[Tuple[float, List[int]]] = []
+        vistos: set[Tuple[int, ...]] = set()
 
-# ---------------------------------------------------------
-# Modo script opcional:
-# python grupo_de_milhoes.py sequencia_real.csv
-# (CSV com 15 colunas: d1,...,d15)
-# ---------------------------------------------------------
-if __name__ == "__main__":
-    import sys
-    import csv
+        max_tentativas = n_resultados * 800  # respiro
+        tentativas = 0
 
-    if len(sys.argv) != 2:
-        print(
-            "Uso: python grupo_de_milhoes.py sequencia_real.csv\n"
-            "CSV precisa ter 15 colunas numéricas (dezenas)."
-        )
-        sys.exit(1)
+        while len(resultados) < n_resultados and tentativas < max_tentativas:
+            tentativas += 1
+            amostra = self.grupo.sample(1)
+            if not amostra:
+                break
 
-    csv_path = sys.argv[1]
-    gm = GrupoDeMilhoes(auto_generate=True)
-
-    concursos: List[List[int]] = []
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        for row in reader:
-            if not row:
+            jogo = amostra[0]
+            key = tuple(jogo)
+            if key in vistos:
                 continue
-            dezenas = [int(x) for x in row[:15]]
-            concursos.append(sorted(dezenas))
+            vistos.add(key)
 
-    gm.remover_sorteadas(concursos)
-    print(
-        f"Grupo de milhões atualizado a partir de {len(concursos)} concursos. "
-        f"Tamanho atual: {len(gm.combos)} combinações."
-    )
+            qtd_frias = sum(1 for d in jogo if d in self.frias)
+            qtd_quentes = sum(1 for d in jogo if d in self.quentes)
+
+            if qtd_frias < min_frias or qtd_quentes < min_quentes:
+                continue
+
+            score = self._score_jogo(jogo)
+            resultados.append((score, jogo))
+
+        resultados.sort(key=lambda x: x[0], reverse=True)
+        return resultados[:n_resultados]
+
+    def fgis_para_dicts(self, fgis: List[Tuple[float, List[int]]]) -> List[Dict]:
+        """
+        Converte a lista [(score, jogo), ...] para algo amigável em JSON.
+        """
+        out: List[Dict] = []
+        for score, jogo in fgis:
+            out.append(
+                {
+                    "jogo": jogo,
+                    "score": score,
+                }
+            )
+        return out
