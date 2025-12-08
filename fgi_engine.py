@@ -1,328 +1,144 @@
-from __future__ import annotations
+# grupo_de_milhoes.py
+#
+# Responsável por:
+# - gerar o universo total de combinações (25C15)
+# - manter o "grupo de milhões" em disco (grupo_de_milhoes.pkl)
+# - remover concursos já sorteados desse universo
+# - entregar amostras de jogos para o FGIMotor
 
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from itertools import combinations
+from typing import Iterable, List
+import os
+import pickle
 import random
-import math
 
 
-# ----------------------------
-# Estrutura principal do motor
-# ----------------------------
-
-@dataclass
-class AnaliseEstado:
-    """
-    Snapshot da análise depois do /carregar.
-    Usado só como tipo interno; o app FastAPI retorna um dict.
-    """
-    total_concursos: int
-    freq: Dict[int, int]
-    frias: List[int]
-    quentes: List[int]
+ARQUIVO_PADRAO = "grupo_de_milhoes.pkl"
 
 
-class FGIMotor:
-    """
-    Motor de análise + geração de FGIs com score.
+class GrupoDeMilhoes:
+    def __init__(self, arquivo: str = ARQUIVO_PADRAO, auto_generate: bool = True):
+        self.arquivo = arquivo
+        self.combos: List[int] = []
 
-    Fluxo:
-      1) carregar(concursos)  -> calcula estatísticas.
-      2) gerar_fino(...)      -> gera N jogos ranqueados por score.
-
-    - concursos: lista de listas, cada jogo com 15 dezenas de 1 a 25.
-    """
-
-    def __init__(self) -> None:
-        self.reset()
-
-    # ----------------------
-    # Estado / inicialização
-    # ----------------------
-    def reset(self) -> None:
-        self.concursos: List[List[int]] = []
-        self.total_concursos: int = 0
-
-        # frequência absoluta por dezena
-        self.freq: Dict[int, int] = {d: 0 for d in range(1, 26)}
-
-        # índice do último concurso em que cada dezena saiu
-        self.ultima_ocorrencia: Dict[int, int | None] = {d: None for d in range(1, 26)}
-
-        # frias/quentes calculadas após carregar()
-        self.frias: List[int] = []
-        self.quentes: List[int] = []
-
-        # cachezinhos
-        self._max_freq: int = 0
-
-    # -------------------------
-    # Carregamento dos concursos
-    # -------------------------
-    def carregar(self, concursos: List[List[int]]) -> Dict:
-        """
-        Atualiza o estado do motor com uma nova janela de concursos.
-
-        - Remove duplicadas dentro do mesmo jogo.
-        - Ignora dezenas fora de [1, 25].
-
-        Retorna um dict pronto para ser devolvido no /carregar:
-        {
-           "total_concursos": ...,
-           "freq": { "1": x, ... },
-           "frias": [ ... ],
-           "quentes": [ ... ]
-        }
-        """
-        self.reset()
-
-        # normaliza entrada
-        concursos_normalizados: List[List[int]] = []
-        for jogo in concursos:
-            if not jogo:
-                continue
-            # remove duplicadas, mantém apenas dezenas válidas
-            limpo = sorted({d for d in jogo if 1 <= d <= 25})
-            if len(limpo) == 15:
-                concursos_normalizados.append(limpo)
-
-        self.concursos = concursos_normalizados
-        self.total_concursos = len(self.concursos)
-
-        # frequência e última ocorrência
-        for idx, jogo in enumerate(self.concursos):
-            for dez in jogo:
-                self.freq[dez] += 1
-                self.ultima_ocorrencia[dez] = idx
-
-        self._max_freq = max(self.freq.values()) if self.total_concursos > 0 else 0
-
-        # define frias / quentes por percentil simples (25% mais baixas / 25% mais altas)
-        if self.total_concursos > 0:
-            ordenado = sorted(self.freq.items(), key=lambda kv: kv[1])  # (dez, freq)
-            k = max(1, 25 // 4)  # 25% de 25 -> 6, mas garante pelo menos 1
-            frias_pairs = ordenado[:k]
-            quentes_pairs = ordenado[-k:]
-
-            self.frias = sorted([d for d, _ in frias_pairs])
-            self.quentes = sorted([d for d, _ in quentes_pairs])
+        if os.path.exists(self.arquivo):
+            self._load()
         else:
-            self.frias = []
-            self.quentes = []
+            if auto_generate:
+                # Gera o universo total logo na primeira vez
+                self._gerar_universo_total()
+            else:
+                self.combos = []
 
-        # formato de saída compatível com o app atual
-        return {
-            "total_concursos": self.total_concursos,
-            "freq": {str(d): self.freq[d] for d in range(1, 26)},
-            "frias": self.frias,
-            "quentes": self.quentes,
-        }
-
-    # -----------------------
-    # Geração com score (FGI)
-    # -----------------------
-    def gerar_fino(
-        self,
-        n: int,
-        min_frias: int = 5,
-        min_quentes: int = 4,
-    ) -> List[Dict]:
-        """
-        Gera N jogos de 15 dezenas com seleção por score.
-
-        - Cada jogo obedece às restrições mínimas de frias/quentes.
-        - Entre todos os candidatos simulados, retornamos os N com melhor score.
-        """
-        if self.total_concursos == 0:
-            raise ValueError("Motor vazio: chame carregar() antes de gerar jogos.")
-
-        # quantidade de amostras (candidatos) para disputar ranking
-        max_amostras = max(2000, n * 250)
-
-        # pseudo-determinismo suave
-        seed_base = self.total_concursos + sum(self.freq.values())
-        random.seed(seed_base)
-
-        candidatos: List[Tuple[float, List[int]]] = []
-
-        alvo_frias = max(0, min_frias)
-        alvo_quentes = max(0, min_quentes)
-        set_frias = set(self.frias)
-        set_quentes = set(self.quentes)
-
-        universo = list(range(1, 26))
-
-        for _ in range(max_amostras):
-            jogo = sorted(random.sample(universo, 15))
-
-            # restrições duras mínimas de frias/quentes
-            qtd_frias = len(set(jogo) & set_frias)
-            qtd_quentes = len(set(jogo) & set_quentes)
-
-            if qtd_frias < alvo_frias:
-                continue
-            if qtd_quentes < alvo_quentes:
-                continue
-
-            score = self._score_jogo(jogo, alvo_frias, alvo_quentes)
-            candidatos.append((score, jogo))
-
-        # ordena do melhor pro pior
-        candidatos.sort(key=lambda x: x[0], reverse=True)
-
-        # remove duplicados, monta saída
-        resultado: List[Dict] = []
-        vistos = set()
-
-        for score, jogo in candidatos:
-            chave = tuple(jogo)
-            if chave in vistos:
-                continue
-            vistos.add(chave)
-
-            ausentes = [d for d in universo if d not in jogo]
-
-            resultado.append(
-                {
-                    "id": len(resultado) + 1,
-                    "score": round(score, 5),
-                    "numeros": jogo,
-                    "ausentes": ausentes,
-                }
-            )
-
-            if len(resultado) >= n:
-                break
-
-        return resultado
-
-    # -----------------
-    # Funções de score
-    # -----------------
-    def _score_jogo(
-        self,
-        jogo: List[int],
-        alvo_frias: int,
-        alvo_quentes: int,
-    ) -> float:
-        """
-        Score composto para um jogo.
-        """
-        if self._max_freq == 0:
-            return 0.0
-
-        # 1) Frequência moderada
-        freqs_norm = [self.freq[d] / self._max_freq for d in jogo]
-        freq_score = 1.0 - self._desvio_medio(freqs_norm, alvo=0.5)
-
-        # 2) Recência
-        distancias_norm = []
+    # ----------------------------------------
+    # Codificação: jogo -> bitmask (25 bits)
+    # ----------------------------------------
+    @staticmethod
+    def _encode(jogo: Iterable[int]) -> int:
+        mask = 0
         for d in jogo:
-            ultima = self.ultima_ocorrencia.get(d)
-            if ultima is None:
-                dist = self.total_concursos
-            else:
-                dist = self.total_concursos - 1 - ultima
-            dist_norm = dist / max(1, self.total_concursos - 1)
-            distancias_norm.append(dist_norm)
+            if not 1 <= d <= 25:
+                raise ValueError(f"Dezena inválida: {d}")
+            mask |= 1 << (d - 1)
+        return mask
 
-        recency_score = 1.0 - self._desvio_medio(distancias_norm, alvo=0.6)
+    @staticmethod
+    def _decode(mask: int) -> List[int]:
+        return [d + 1 for d in range(25) if mask & (1 << d)]
 
-        # 3) Frias / quentes
-        set_frias = set(self.frias)
-        set_quentes = set(self.quentes)
-        qtd_frias = len(set(jogo) & set_frias)
-        qtd_quentes = len(set(jogo) & set_quentes)
+    # ----------------------------------------
+    # Persistência
+    # ----------------------------------------
+    def _save(self) -> None:
+        with open(self.arquivo, "wb") as f:
+            pickle.dump(self.combos, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-        frias_score = self._score_por_alvo(qtd_frias, alvo_frias)
-        quentes_score = self._score_por_alvo(qtd_quentes, alvo_quentes)
+    def _load(self) -> None:
+        with open(self.arquivo, "rb") as f:
+            self.combos = pickle.load(f)
 
-        # 4) Equilíbrio
-        balance_score = self._score_balance(jogo)
+    # ----------------------------------------
+    # Universo total e remoção das sorteadas
+    # ----------------------------------------
+    def _gerar_universo_total(self) -> None:
+        """
+        Gera TODAS as combinações de 15 dezenas entre 1..25.
+        Tamanho: 3.268.760 combinações.
+        Roda uma vez, salva em grupo_de_milhoes.pkl.
+        """
+        combos: List[int] = []
+        for comb in combinations(range(1, 26), 15):
+            combos.append(self._encode(comb))
 
-        # 5) Penalidade de padrões ruins
-        pattern_penalty = self._pattern_penalty(jogo)
+        self.combos = combos
+        self._save()
 
-        score = (
-            0.30 * freq_score
-            + 0.25 * recency_score
-            + 0.15 * frias_score
-            + 0.15 * quentes_score
-            + 0.15 * balance_score
-            - pattern_penalty
+    def remover_sorteadas(self, concursos: List[List[int]]) -> None:
+        """
+        Remove do grupo todas as combinações que já saíram.
+        Pode ser chamado várias vezes (incremental).
+        """
+        if not self.combos:
+            return
+
+        base = set(self.combos)
+        alterou = False
+
+        for jogo in concursos:
+            mask = self._encode(jogo)
+            if mask in base:
+                base.remove(mask)
+                alterou = True
+
+        if alterou:
+            self.combos = list(base)
+            self._save()
+
+    # ----------------------------------------
+    # Amostragem para o motor
+    # ----------------------------------------
+    def sample(self, n: int) -> List[List[int]]:
+        """
+        Retorna n jogos distintos do grupo (em forma de listas de dezenas).
+        """
+        if not self.combos:
+            return []
+
+        n = min(n, len(self.combos))
+        indices = random.sample(range(len(self.combos)), n)
+        return [self._decode(self.combos[i]) for i in indices]
+
+
+# ---------------------------------------------------------
+# Modo script opcional:
+# python grupo_de_milhoes.py sequencia_real.csv
+# (CSV com 15 colunas: d1,...,d15)
+# ---------------------------------------------------------
+if __name__ == "__main__":
+    import sys
+    import csv
+
+    if len(sys.argv) != 2:
+        print(
+            "Uso: python grupo_de_milhoes.py sequencia_real.csv\n"
+            "CSV precisa ter 15 colunas numéricas (dezenas)."
         )
+        sys.exit(1)
 
-        return float(score)
+    csv_path = sys.argv[1]
+    gm = GrupoDeMilhoes(auto_generate=True)
 
-    @staticmethod
-    def _desvio_medio(valores: List[float], alvo: float) -> float:
-        if not valores:
-            return 0.0
-        desvios = [abs(v - alvo) for v in valores]
-        return sum(desvios) / len(desvios)
+    concursos: List[List[int]] = []
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if not row:
+                continue
+            dezenas = [int(x) for x in row[:15]]
+            concursos.append(sorted(dezenas))
 
-    @staticmethod
-    def _score_por_alvo(qtd: int, alvo: int) -> float:
-        if alvo <= 0:
-            return 1.0
-        diff = abs(qtd - alvo)
-        return max(0.0, 1.0 - diff / max(1.0, float(alvo)))
-
-    @staticmethod
-    def _score_balance(jogo: List[int]) -> float:
-        if not jogo:
-            return 0.0
-
-        # regiões
-        r1 = sum(1 for d in jogo if 1 <= d <= 8)
-        r2 = sum(1 for d in jogo if 9 <= d <= 17)
-        r3 = sum(1 for d in jogo if 18 <= d <= 25)
-
-        alvo_regiao = len(jogo) / 3.0
-        desv_regioes = (
-            abs(r1 - alvo_regiao) + abs(r2 - alvo_regiao) + abs(r3 - alvo_regiao)
-        ) / (3 * alvo_regiao)
-
-        # par/ímpar
-        pares = sum(1 for d in jogo if d % 2 == 0)
-        impares = len(jogo) - pares
-        alvo_par_impar = len(jogo) / 2.0
-        desv_par_impar = (
-            abs(pares - alvo_par_impar) + abs(impares - alvo_par_impar)
-        ) / (2 * alvo_par_impar)
-
-        regiao_score = max(0.0, 1.0 - desv_regioes)
-        par_impar_score = max(0.0, 1.0 - desv_par_impar)
-
-        return (regiao_score + par_impar_score) / 2.0
-
-    @staticmethod
-    def _pattern_penalty(jogo: List[int]) -> float:
-        if not jogo:
-            return 0.0
-
-        # sequências consecutivas
-        seq_len_max = 1
-        seq_atual = 1
-        for a, b in zip(jogo, jogo[1:]):
-            if b == a + 1:
-                seq_atual += 1
-                seq_len_max = max(seq_len_max, seq_atual)
-            else:
-                seq_atual = 1
-
-        penalty_seq = 0.0
-        if seq_len_max >= 4:
-            penalty_seq += 0.10
-        if seq_len_max >= 5:
-            penalty_seq += 0.05
-
-        # concentração em faixa estreita
-        amplitude = max(jogo) - min(jogo)
-        penalty_faixa = 0.0
-        if amplitude < 12:
-            penalty_faixa = 0.10
-        elif amplitude < 16:
-            penalty_faixa = 0.05
-
-        return penalty_seq + penalty_faixa
+    gm.remover_sorteadas(concursos)
+    print(
+        f"Grupo de milhões atualizado a partir de {len(concursos)} concursos. "
+        f"Tamanho atual: {len(gm.combos)} combinações."
+    )
