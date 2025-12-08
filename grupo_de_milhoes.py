@@ -1,191 +1,144 @@
-from __future__ import annotations
+# grupo_de_milhoes.py
+#
+# Responsável por:
+# - gerar o universo total de combinações (25C15)
+# - manter o "grupo de milhões" em disco (grupo_de_milhoes.pkl)
+# - remover concursos já sorteados desse universo
+# - entregar amostras de jogos para o FGIMotor
 
 from itertools import combinations
-from pathlib import Path
-from typing import Iterable, Sequence, Tuple, List, Set
-import csv
+from typing import Iterable, List
+import os
 import pickle
 import random
 
 
-# Cada jogo é uma tupla ordenada com 15 dezenas, ex: (1, 3, 5, ..., 25)
-Combo = Tuple[int, ...]
+ARQUIVO_PADRAO = "grupo_de_milhoes.pkl"
 
 
-# ------------------------------
-# Funções de normalização
-# ------------------------------
+class GrupoDeMilhoes:
+    def __init__(self, arquivo: str = ARQUIVO_PADRAO, auto_generate: bool = True):
+        self.arquivo = arquivo
+        self.combos: List[int] = []
 
-def normalizar_concurso(seq: Sequence[int]) -> Combo:
-    """
-    Recebe uma sequência de dezenas (qualquer ordem, str/int) e
-    devolve uma tupla ordenada, ex: (1, 3, 7, ..., 25).
-    """
-    nums = [int(x) for x in seq]
-    return tuple(sorted(nums))
+        if os.path.exists(self.arquivo):
+            self._load()
+        else:
+            if auto_generate:
+                # Gera o universo total logo na primeira vez
+                self._gerar_universo_total()
+            else:
+                self.combos = []
 
+    # ----------------------------------------
+    # Codificação: jogo -> bitmask (25 bits)
+    # ----------------------------------------
+    @staticmethod
+    def _encode(jogo: Iterable[int]) -> int:
+        mask = 0
+        for d in jogo:
+            if not 1 <= d <= 25:
+                raise ValueError(f"Dezena inválida: {d}")
+            mask |= 1 << (d - 1)
+        return mask
 
-def extrair_dezenas_de_linha(campos: Sequence[str]) -> List[int]:
-    """
-    Linha genérica de CSV. Varre todos os campos, pega só números 1..25.
+    @staticmethod
+    def _decode(mask: int) -> List[int]:
+        return [d + 1 for d in range(25) if mask & (1 << d)]
 
-    Serve mesmo que o CSV tenha:
-      - colunas de concurso/data
-      - dezenas separadas por espaço, ponto, hífen etc.
-    """
-    dezenas: List[int] = []
-    for campo in campos:
-        bruto = (
-            campo.replace("-", " ")
-                 .replace(".", " ")
-                 .replace(";", " ")
-                 .replace(",", " ")
-        )
-        for token in bruto.split():
-            if token.isdigit():
-                n = int(token)
-                if 1 <= n <= 25:
-                    dezenas.append(n)
+    # ----------------------------------------
+    # Persistência
+    # ----------------------------------------
+    def _save(self) -> None:
+        with open(self.arquivo, "wb") as f:
+            pickle.dump(self.combos, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    # se vier mais de 15, corta; se vier menos, essa linha será ignorada depois
-    return dezenas[:15]
+    def _load(self) -> None:
+        with open(self.arquivo, "rb") as f:
+            self.combos = pickle.load(f)
 
+    # ----------------------------------------
+    # Universo total e remoção das sorteadas
+    # ----------------------------------------
+    def _gerar_universo_total(self) -> None:
+        """
+        Gera TODAS as combinações de 15 dezenas entre 1..25.
+        Tamanho: 3.268.760 combinações.
+        Roda uma vez, salva em grupo_de_milhoes.pkl.
+        """
+        combos: List[int] = []
+        for comb in combinations(range(1, 26), 15):
+            combos.append(self._encode(comb))
 
-# ------------------------------
-# Carregar histórico de sorteios
-# ------------------------------
+        self.combos = combos
+        self._save()
 
-def carregar_sorteios_csv(
-    caminho_csv: str | Path,
-    pular_cabecalho: bool = True,
-) -> Set[Combo]:
-    """
-    Lê um CSV com todos os sorteios reais e devolve um SET de tuplas (combo normalizado).
+    def remover_sorteadas(self, concursos: List[List[int]]) -> None:
+        """
+        Remove do grupo todas as combinações que já saíram.
+        Pode ser chamado várias vezes (incremental).
+        """
+        if not self.combos:
+            return
 
-    Regras:
-      - pega apenas números 1..25
-      - se achar 15 dezenas em uma linha -> considera um concurso
-      - linhas com menos de 15 dezenas são ignoradas
-    """
-    caminho = Path(caminho_csv)
-    if not caminho.exists():
-        raise FileNotFoundError(f"CSV não encontrado: {caminho}")
+        base = set(self.combos)
+        alterou = False
 
-    sorteados: Set[Combo] = set()
+        for jogo in concursos:
+            mask = self._encode(jogo)
+            if mask in base:
+                base.remove(mask)
+                alterou = True
 
-    with caminho.open("r", newline="", encoding="utf-8") as f:
-        leitor = csv.reader(f)
-        if pular_cabecalho:
-            next(leitor, None)
+        if alterou:
+            self.combos = list(base)
+            self._save()
 
-        for linha in leitor:
-            dezenas = extrair_dezenas_de_linha(linha)
-            if len(dezenas) == 15:
-                sorteados.add(normalizar_concurso(dezenas))
+    # ----------------------------------------
+    # Amostragem para o motor
+    # ----------------------------------------
+    def sample(self, n: int) -> List[List[int]]:
+        """
+        Retorna n jogos distintos do grupo (em forma de listas de dezenas).
+        """
+        if not self.combos:
+            return []
 
-    return sorteados
-
-
-# ------------------------------
-# Universo total C(25, 15)
-# ------------------------------
-
-def gerar_universo_total() -> Iterable[Combo]:
-    """
-    Gera TODAS as combinações de 15 dezenas entre 1 e 25 (C(25,15)=3.268.760).
-    Stream: não carrega tudo em memória de uma vez.
-    """
-    for comb in combinations(range(1, 26), 15):
-        yield comb
-
-
-# ------------------------------
-# Construção do grupo de milhões
-# ------------------------------
-
-def construir_grupo_de_milhoes(
-    csv_sorteios: str | Path,
-    destino_pkl: str | Path = "grupo_de_milhoes.pkl",
-    amostra: int | None = None,
-) -> None:
-    """
-    - Lê o histórico de sorteios do CSV.
-    - Gera o universo total.
-    - Remove TUDO que já saiu.
-    - Salva o grupo de milhões em um .pkl (lista de tuplas).
-
-    IMPORTANTE:
-      • Isso é pesado. A ideia é rodar LOCALMENTE (seu PC), NÃO no Render.
-      • Depois que o .pkl estiver pronto, você sobe o arquivo pro GitHub.
-
-    Parâmetro 'amostra':
-      - Se None: salva o grupo completo (arquivo grande).
-      - Se int: faz um sample aleatório do grupo (para testes).
-    """
-    csv_sorteios = Path(csv_sorteios)
-    destino_pkl = Path(destino_pkl)
-
-    print(f"[1/3] Carregando sorteios reais de {csv_sorteios} ...")
-    sorteados = carregar_sorteios_csv(csv_sorteios)
-    print(f"   -> {len(sorteados)} concursos únicos carregados.")
-
-    print("[2/3] Construindo grupo de milhões (streaming)...")
-    grupo: List[Combo] = []
-    total_universo = 0
-    restantes = 0
-
-    for comb in gerar_universo_total():
-        total_universo += 1
-        if comb not in sorteados:
-            grupo.append(comb)
-            restantes += 1
-
-    print(f"   Universo total        : {total_universo:,}")
-    print(f"   Ainda não sorteados   : {restantes:,}")
-
-    if amostra is not None and amostra < len(grupo):
-        print(f"[opcional] Aplicando amostra aleatória de {amostra} jogos...")
-        grupo = random.sample(grupo, amostra)
-
-    print(f"[3/3] Salvando grupo em {destino_pkl} ...")
-    with destino_pkl.open("wb") as f:
-        pickle.dump(grupo, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-    print("Concluído.")
+        n = min(n, len(self.combos))
+        indices = random.sample(range(len(self.combos)), n)
+        return [self._decode(self.combos[i]) for i in indices]
 
 
-# ------------------------------
-# Utilidade de leitura
-# ------------------------------
-
-def carregar_grupo_de_milhoes(path: str | Path) -> List[Combo]:
-    """
-    Lê o .pkl criado pela função construir_grupo_de_milhoes
-    e devolve a lista de combinações.
-    """
-    path = Path(path)
-    with path.open("rb") as f:
-        grupo: List[Combo] = pickle.load(f)
-    return grupo
-
-
-# ------------------------------
-# Interface de linha de comando (opcional)
-# ------------------------------
-
+# ---------------------------------------------------------
+# Modo script opcional:
+# python grupo_de_milhoes.py sequencia_real.csv
+# (CSV com 15 colunas: d1,...,d15)
+# ---------------------------------------------------------
 if __name__ == "__main__":
-    import argparse
+    import sys
+    import csv
 
-    parser = argparse.ArgumentParser(
-        description="Constrói o grupo de milhões a partir de um CSV de sorteios reais."
+    if len(sys.argv) != 2:
+        print(
+            "Uso: python grupo_de_milhoes.py sequencia_real.csv\n"
+            "CSV precisa ter 15 colunas numéricas (dezenas)."
+        )
+        sys.exit(1)
+
+    csv_path = sys.argv[1]
+    gm = GrupoDeMilhoes(auto_generate=True)
+
+    concursos: List[List[int]] = []
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if not row:
+                continue
+            dezenas = [int(x) for x in row[:15]]
+            concursos.append(sorted(dezenas))
+
+    gm.remover_sorteadas(concursos)
+    print(
+        f"Grupo de milhões atualizado a partir de {len(concursos)} concursos. "
+        f"Tamanho atual: {len(gm.combos)} combinações."
     )
-    parser.add_argument("csv_sorteios", help="caminho do CSV com todos os concursos reais")
-    parser.add_argument("--destino", default="grupo_de_milhoes.pkl", help="arquivo .pkl de saída")
-    parser.add_argument("--amostra", type=int, default=None, help="amostra aleatória opcional")
-    args = parser.parse_args()
-
-    construir_grupo_de_milhoes(
-        csv_sorteios=args.csv_sorteios,
-        destino_pkl=args.destino,
-        amostra=args.amostra,
-  )
