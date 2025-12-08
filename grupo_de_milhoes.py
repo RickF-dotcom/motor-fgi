@@ -1,19 +1,29 @@
 # grupo_de_milhoes.py
 #
-# Responsável por:
-# - gerar o universo total de combinações (25C15)
-# - manter o "grupo de milhões" em disco (grupo_de_milhoes.pkl)
-# - remover concursos já sorteados desse universo
-# - entregar amostras de jogos para o FGIMotor
+# Responsável por manter o "grupo de milhões":
+# - universo total de combinações 15/25 (3.268.760 jogos)
+# - MENOS todas as combinações já sorteadas
+#   (vindas do historico sequencia_real.csv, se existir)
+# - MENOS os concursos que você enviar via /carregar
+#
+# A API usada pelo FGIMotor:
+#   - GrupoDeMilhoes()
+#   - remover_sorteadas(concursos)
+#   - sample(n)  -> devolve n jogos (listas de dezenas)
+
+from __future__ import annotations
 
 from itertools import combinations
+from pathlib import Path
 from typing import Iterable, List
+import csv
 import os
 import pickle
 import random
 
 
 ARQUIVO_PADRAO = "grupo_de_milhoes.pkl"
+HISTORICO_CSV = Path(__file__).parent / "sequencia_real.csv"
 
 
 class GrupoDeMilhoes:
@@ -21,14 +31,19 @@ class GrupoDeMilhoes:
         self.arquivo = arquivo
         self.combos: List[int] = []
 
+        # 1) tenta carregar do .pkl
         if os.path.exists(self.arquivo):
             self._load()
         else:
+            # 2) se não existir, pode gerar universo total
             if auto_generate:
-                # Gera o universo total logo na primeira vez
                 self._gerar_universo_total()
             else:
                 self.combos = []
+
+        # 3) se existir histórico em CSV, remove sorteadas do universo
+        if self.combos and HISTORICO_CSV.exists():
+            self._remover_sorteadas_de_csv()
 
     # ----------------------------------------
     # Codificação: jogo -> bitmask (25 bits)
@@ -58,7 +73,7 @@ class GrupoDeMilhoes:
             self.combos = pickle.load(f)
 
     # ----------------------------------------
-    # Universo total e remoção das sorteadas
+    # Universo total
     # ----------------------------------------
     def _gerar_universo_total(self) -> None:
         """
@@ -73,6 +88,43 @@ class GrupoDeMilhoes:
         self.combos = combos
         self._save()
 
+    # ----------------------------------------
+    # Remoção de sorteadas (via CSV histórico)
+    # ----------------------------------------
+    def _remover_sorteadas_de_csv(self) -> None:
+        """
+        Lê o sequencia_real.csv (se existir) e remove TODAS
+        as combinações já sorteadas do universo.
+        """
+        base = set(self.combos)
+        alterou = False
+
+        try:
+            with HISTORICO_CSV.open("r", newline="", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    nums = [c.strip() for c in row if c.strip()]
+                    if not nums:
+                        continue
+                    dezenas = [int(x) for x in nums[:15]]
+                    dezenas_validas = [d for d in dezenas if 1 <= d <= 25]
+                    if len(dezenas_validas) != 15:
+                        continue
+                    mask = self._encode(dezenas_validas)
+                    if mask in base:
+                        base.remove(mask)
+                        alterou = True
+        except Exception:
+            # se der erro de leitura, não mata o servidor; só segue com o que tem
+            return
+
+        if alterou:
+            self.combos = list(base)
+            self._save()
+
+    # ----------------------------------------
+    # Remoção incremental (via /carregar)
+    # ----------------------------------------
     def remover_sorteadas(self, concursos: List[List[int]]) -> None:
         """
         Remove do grupo todas as combinações que já saíram.
@@ -85,7 +137,10 @@ class GrupoDeMilhoes:
         alterou = False
 
         for jogo in concursos:
-            mask = self._encode(jogo)
+            dezenas_validas = [d for d in jogo if 1 <= d <= 25]
+            if len(dezenas_validas) != 15:
+                continue
+            mask = self._encode(dezenas_validas)
             if mask in base:
                 base.remove(mask)
                 alterou = True
@@ -107,38 +162,3 @@ class GrupoDeMilhoes:
         n = min(n, len(self.combos))
         indices = random.sample(range(len(self.combos)), n)
         return [self._decode(self.combos[i]) for i in indices]
-
-
-# ---------------------------------------------------------
-# Modo script opcional:
-# python grupo_de_milhoes.py sequencia_real.csv
-# (CSV com 15 colunas: d1,...,d15)
-# ---------------------------------------------------------
-if __name__ == "__main__":
-    import sys
-    import csv
-
-    if len(sys.argv) != 2:
-        print(
-            "Uso: python grupo_de_milhoes.py sequencia_real.csv\n"
-            "CSV precisa ter 15 colunas numéricas (dezenas)."
-        )
-        sys.exit(1)
-
-    csv_path = sys.argv[1]
-    gm = GrupoDeMilhoes(auto_generate=True)
-
-    concursos: List[List[int]] = []
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        for row in reader:
-            if not row:
-                continue
-            dezenas = [int(x) for x in row[:15]]
-            concursos.append(sorted(dezenas))
-
-    gm.remover_sorteadas(concursos)
-    print(
-        f"Grupo de milhões atualizado a partir de {len(concursos)} concursos. "
-        f"Tamanho atual: {len(gm.combos)} combinações."
-    )
