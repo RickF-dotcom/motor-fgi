@@ -1,4 +1,4 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
@@ -13,6 +13,7 @@ from fgi_engine import FGIMotor
 # -------------------------
 # Modelos de entrada
 # -------------------------
+
 
 class CarregarRequest(BaseModel):
     # cada concurso é uma lista de dezenas (idealmente 15, de 1 a 25)
@@ -29,12 +30,25 @@ app = FastAPI(
     description="API do motor de FGIs com score + grupo de milhões.",
 )
 
-motor = FGIMotor()
+# motor é recriado sempre que /carregar é chamado
+motor: Optional[FGIMotor] = None
+
+
+def novo_motor() -> FGIMotor:
+    """
+    Cria um motor novo já integrado ao grupo de milhões.
+
+    O FGIMotor, por dentro, carrega o grupo de milhões
+    e remove do universo as combinações já sorteadas
+    com base no CSV histórico.
+    """
+    return FGIMotor()
 
 
 # -------------------------
 # Ping raiz
 # -------------------------
+
 
 @app.get("/")
 def root() -> Dict[str, str]:
@@ -45,11 +59,15 @@ def root() -> Dict[str, str]:
 # /carregar
 # -------------------------
 
+
 @app.post("/carregar")
 def carregar(req: CarregarRequest) -> Dict[str, Any]:
     """
-    Carrega uma janela de concursos no motor e devolve
+    Carrega uma JANELA de concursos no motor e devolve
     as estatísticas básicas (freq, frias, quentes).
+
+    Você manda APENAS os concursos da janela (ex.: últimos 25),
+    o motor é recriado do zero para analisar só essa janela.
 
     Exemplo de body (JSON):
 
@@ -60,19 +78,23 @@ def carregar(req: CarregarRequest) -> Dict[str, Any]:
       ]
     }
     """
-    try:
-        # Usa o método novo que já integra com o GrupoDeMilhoes
-        estado = motor.carregar_concursos(req.concursos)
+    global motor
 
-        # estado pode ser um objeto (dataclass) ou um dict,
-        # então trato os dois casos de forma segura.
+    try:
+        # sempre começa com um motor novo para esta janela
+        motor = novo_motor()
+
+        # fgi_engine.FGIMotor.carregar devolve um objeto de estado
+        estado = motor.carregar(req.concursos)
+
+        # estado pode ser dict (versão antiga) ou dataclass AnaliseEstado
         if isinstance(estado, dict):
             total_concursos = estado.get("total_concursos")
             freq = estado.get("freq")
             frias = estado.get("frias")
             quentes = estado.get("quentes")
         else:
-            # AnaliseEstado
+            # dataclass AnaliseEstado
             total_concursos = getattr(estado, "total_concursos", None)
             freq = getattr(estado, "freq", None)
             frias = getattr(estado, "frias", None)
@@ -86,20 +108,21 @@ def carregar(req: CarregarRequest) -> Dict[str, Any]:
             "quentes": quentes,
         }
 
-    except HTTPException:
-        # Se eu mesmo lancei HTTPException, só repasso
-        raise
     except ValueError as e:
-        # Entrada inválida (ex: dezenas fora de 1..25, tamanho errado etc.)
+        # erro de validação de entrada
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        # se já for HTTPException, só repassa
+        raise
     except Exception as e:
-        # Erro interno inesperado
+        # qualquer outro erro é 500
         raise HTTPException(status_code=500, detail=f"erro interno: {e}")
 
 
 # -------------------------
 # /gerar_fino
 # -------------------------
+
 
 @app.get("/gerar_fino")
 def gerar_fino(
@@ -108,17 +131,24 @@ def gerar_fino(
     min_quentes: int = 4,
 ) -> Dict[str, Any]:
     """
-    Gera N jogos (FGIs) usando o motor com score,
-    respeitando mínimos de frias/quentes.
+    Gera N jogos (FGIs) usando o motor com score, baseado
+    na ÚLTIMA janela carregada em /carregar.
 
     Parâmetros:
       - n: quantidade de jogos (default 32)
       - min_frias: mínimo de dezenas frias por jogo
       - min_quentes: mínimo de dezenas quentes por jogo
 
-    Exemplo:
+    Exemplo de uso:
+
       GET /gerar_fino?n=32&min_frias=5&min_quentes=4
     """
+    if motor is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Nenhum concurso carregado. Chame /carregar antes.",
+        )
+
     try:
         jogos = motor.gerar_fino(
             n=n,
@@ -140,22 +170,23 @@ def gerar_fino(
 # /ultimos25.csv
 # -------------------------
 
+
 @app.get("/ultimos25.csv", response_class=PlainTextResponse)
 def ultimos_25_csv() -> str:
     """
-    Exporta os últimos 25 concursos carregados em formato CSV.
+    Exporta os últimos 25 concursos carregados EM MEMÓRIA
+    (ou menos, se tiver menos carregados) em formato CSV.
 
     - Baseado em motor.concursos (ordem em que foram carregados).
-    - Se existirem menos de 25 concursos, exporta só o que tiver.
     - Separador: ponto e vírgula (;)
 
     Cabeçalho:
       concurso;d1;d2;...;d15
     """
-    if not getattr(motor, "concursos", None):
+    if motor is None or not getattr(motor, "concursos", None):
         raise HTTPException(
             status_code=400,
-            detail="Nenhum concurso carregado. Chame /carregar antes."
+            detail="Nenhum concurso carregado. Chame /carregar antes.",
         )
 
     concursos = motor.concursos
@@ -163,7 +194,7 @@ def ultimos_25_csv() -> str:
     ultimos = concursos[-qtd:]
 
     buffer = StringIO()
-    writer = csv.writer(buffer, delimiter=';')
+    writer = csv.writer(buffer, delimiter=";")
 
     # Cabeçalho
     header = ["concurso"] + [f"d{i}" for i in range(1, 16)]
