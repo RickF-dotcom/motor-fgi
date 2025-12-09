@@ -2,15 +2,15 @@ from typing import List, Dict
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from fgi_engine import FGIMotor
-
 from fastapi.responses import PlainTextResponse
 from io import StringIO
 import csv
 
+from fgi_engine import FGIMotor
+
 
 # -------------------------
-# Modelos de entrada
+# Modelo de entrada
 # -------------------------
 
 class CarregarRequest(BaseModel):
@@ -19,7 +19,7 @@ class CarregarRequest(BaseModel):
 
 
 # -------------------------
-# Instâncias principais
+# Instância principal
 # -------------------------
 
 app = FastAPI(
@@ -55,22 +55,29 @@ def carregar(req: CarregarRequest):
     {
       "concursos": [
         [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],
-        [1,3,5,7,9,11,13,15,17,19,21,22,23,24,25]
+        [1,3,5,7,9,11,13,15,17,19,21,23,25,2,4]
       ]
     }
     """
     try:
+        # Atualiza o motor com os concursos
+        # motor.carregar retorna um AnaliseEstado (objeto)
         estado = motor.carregar(req.concursos)
+
+        # Usa ATRIBUTOS do objeto, não índice
         return {
             "status": "ok",
-            "total_concursos": estado["total_concursos"],
-            "freq": estado["freq"],
-            "frias": estado["frias"],
-            "quentes": estado["quentes"],
+            "total_concursos": estado.total_concursos,
+            "freq": estado.freq,
+            "frias": estado.frias,
+            "quentes": estado.quentes,
         }
+
     except ValueError as e:
+        # Erros de validação / entrada ruim
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        # Erro interno qualquer → 500
         raise HTTPException(status_code=500, detail=f"erro interno: {e}")
 
 
