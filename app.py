@@ -1,8 +1,9 @@
-from typing import List, Dict
+from typing import List, Dict, Any
+
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
-from fastapi.responses import PlainTextResponse
 from io import StringIO
 import csv
 
@@ -10,7 +11,7 @@ from fgi_engine import FGIMotor
 
 
 # -------------------------
-# Modelo de entrada
+# Modelos de entrada
 # -------------------------
 
 class CarregarRequest(BaseModel):
@@ -25,7 +26,7 @@ class CarregarRequest(BaseModel):
 app = FastAPI(
     title="Motor FGI",
     version="1.0.0",
-    description="API do motor de FGIs com score."
+    description="API do motor de FGIs com score + grupo de milhões.",
 )
 
 motor = FGIMotor()
@@ -45,7 +46,7 @@ def root() -> Dict[str, str]:
 # -------------------------
 
 @app.post("/carregar")
-def carregar(req: CarregarRequest):
+def carregar(req: CarregarRequest) -> Dict[str, Any]:
     """
     Carrega uma janela de concursos no motor e devolve
     as estatísticas básicas (freq, frias, quentes).
@@ -60,24 +61,39 @@ def carregar(req: CarregarRequest):
     }
     """
     try:
-        # Atualiza o motor com os concursos
-        # motor.carregar retorna um AnaliseEstado (objeto)
-        estado = motor.carregar(req.concursos)
+        # Usa o método novo que já integra com o GrupoDeMilhoes
+        estado = motor.carregar_concursos(req.concursos)
 
-        # Usa ATRIBUTOS do objeto, não índice
+        # estado pode ser um objeto (dataclass) ou um dict,
+        # então trato os dois casos de forma segura.
+        if isinstance(estado, dict):
+            total_concursos = estado.get("total_concursos")
+            freq = estado.get("freq")
+            frias = estado.get("frias")
+            quentes = estado.get("quentes")
+        else:
+            # AnaliseEstado
+            total_concursos = getattr(estado, "total_concursos", None)
+            freq = getattr(estado, "freq", None)
+            frias = getattr(estado, "frias", None)
+            quentes = getattr(estado, "quentes", None)
+
         return {
             "status": "ok",
-            "total_concursos": estado.total_concursos,
-            "freq": estado.freq,
-            "frias": estado.frias,
-            "quentes": estado.quentes,
+            "total_concursos": total_concursos,
+            "freq": freq,
+            "frias": frias,
+            "quentes": quentes,
         }
 
+    except HTTPException:
+        # Se eu mesmo lancei HTTPException, só repasso
+        raise
     except ValueError as e:
-        # Erros de validação / entrada ruim
+        # Entrada inválida (ex: dezenas fora de 1..25, tamanho errado etc.)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        # Erro interno qualquer → 500
+        # Erro interno inesperado
         raise HTTPException(status_code=500, detail=f"erro interno: {e}")
 
 
@@ -90,17 +106,17 @@ def gerar_fino(
     n: int = 32,
     min_frias: int = 5,
     min_quentes: int = 4,
-):
+) -> Dict[str, Any]:
     """
-    Gera N jogos (FGIs) usando o motor com score.
+    Gera N jogos (FGIs) usando o motor com score,
+    respeitando mínimos de frias/quentes.
 
     Parâmetros:
       - n: quantidade de jogos (default 32)
       - min_frias: mínimo de dezenas frias por jogo
       - min_quentes: mínimo de dezenas quentes por jogo
 
-    Exemplo de uso:
-
+    Exemplo:
       GET /gerar_fino?n=32&min_frias=5&min_quentes=4
     """
     try:
@@ -125,7 +141,7 @@ def gerar_fino(
 # -------------------------
 
 @app.get("/ultimos25.csv", response_class=PlainTextResponse)
-def ultimos_25_csv():
+def ultimos_25_csv() -> str:
     """
     Exporta os últimos 25 concursos carregados em formato CSV.
 
