@@ -1,213 +1,138 @@
-from typing import List, Dict, Any, Optional
-
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
+from typing import List
 
-from io import StringIO
-import csv
+from fgi_engine import MotorFGI
+from grupo_de_milhoes import GrupoMilhoes
 
-from fgi_engine import FGIMotor
-
-
-# -------------------------
-# Modelos de entrada
-# -------------------------
+# IMPORTA O MÓDULO DE MATURAÇÃO
+from maturacao import calcular_maturacao, score_maturacao_jogo
 
 
+# ==============================
+#   MODELO DO REQUEST /carregar
+# ==============================
 class CarregarRequest(BaseModel):
-    # cada concurso é uma lista de dezenas (idealmente 15, de 1 a 25)
     concursos: List[List[int]]
 
 
-# -------------------------
-# Instância principal
-# -------------------------
-
+# ======================
+#   APLICAÇÃO FASTAPI
+# ======================
 app = FastAPI(
     title="Motor FGI",
     version="1.0.0",
-    description="API do motor de FGIs com score + grupo de milhões.",
+    description="API do motor de FGIs com score + grupo de milhões + maturação."
 )
 
-# motor é recriado sempre que /carregar é chamado
-motor: Optional[FGIMotor] = None
+motor = None
+HISTORICO = []   # Guarda a sequência carregada p/ maturação
+grupo = GrupoMilhoes()
 
 
-def novo_motor() -> FGIMotor:
-    """
-    Cria um motor novo já integrado ao grupo de milhões.
-
-    O FGIMotor, por dentro, carrega o grupo de milhões
-    e remove do universo as combinações já sorteadas
-    com base no CSV histórico.
-    """
-    return FGIMotor()
-
-
-# -------------------------
-# Ping raiz
-# -------------------------
-
-
+# ============
+#   ROOT
+# ============
 @app.get("/")
-def root() -> Dict[str, str]:
-    return {"status": "ok", "message": "motor-fgi online"}
+async def root():
+    return {"status": "online", "msg": "Motor FGI ativo"}
 
 
-# -------------------------
-# /carregar
-# -------------------------
-
-
+# =======================
+#   POST /carregar
+# =======================
 @app.post("/carregar")
-def carregar(req: CarregarRequest) -> Dict[str, Any]:
-    """
-    Carrega uma JANELA de concursos no motor e devolve
-    as estatísticas básicas (freq, frias, quentes).
+async def carregar(req: CarregarRequest):
+    global motor, HISTORICO
 
-    Você manda APENAS os concursos da janela (ex.: últimos 25),
-    o motor é recriado do zero para analisar só essa janela.
+    if len(req.concursos) == 0:
+        raise HTTPException(status_code=400, detail="Nenhum concurso enviado.")
 
-    Exemplo de body (JSON):
+    motor = MotorFGI(req.concursos)
+    HISTORICO = req.concursos[:]  # para maturação
 
-    {
-      "concursos": [
-        [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],
-        [1,3,5,7,9,11,13,15,17,19,21,23,25,2,4]
-      ]
+    freq = motor.freq
+    frias = motor.frias
+    quentes = motor.quentes
+
+    return {
+        "status": "ok",
+        "total_concursos": len(req.concursos),
+        "freq": freq,
+        "frias": frias,
+        "quentes": quentes
     }
-    """
-    global motor
-
-    try:
-        # sempre começa com um motor novo para esta janela
-        motor = novo_motor()
-
-        # fgi_engine.FGIMotor.carregar devolve um objeto de estado
-        estado = motor.carregar(req.concursos)
-
-        # estado pode ser dict (versão antiga) ou dataclass AnaliseEstado
-        if isinstance(estado, dict):
-            total_concursos = estado.get("total_concursos")
-            freq = estado.get("freq")
-            frias = estado.get("frias")
-            quentes = estado.get("quentes")
-        else:
-            # dataclass AnaliseEstado
-            total_concursos = getattr(estado, "total_concursos", None)
-            freq = getattr(estado, "freq", None)
-            frias = getattr(estado, "frias", None)
-            quentes = getattr(estado, "quentes", None)
-
-        return {
-            "status": "ok",
-            "total_concursos": total_concursos,
-            "freq": freq,
-            "frias": frias,
-            "quentes": quentes,
-        }
-
-    except ValueError as e:
-        # erro de validação de entrada
-        raise HTTPException(status_code=400, detail=str(e))
-    except HTTPException:
-        # se já for HTTPException, só repassa
-        raise
-    except Exception as e:
-        # qualquer outro erro é 500
-        raise HTTPException(status_code=500, detail=f"erro interno: {e}")
 
 
-# -------------------------
-# /gerar_fino
-# -------------------------
-
-
+# ======================================
+#   GET /gerar_fino
+# ======================================
 @app.get("/gerar_fino")
-def gerar_fino(
+async def gerar_fino(
     n: int = 32,
-    min_frias: int = 5,
+    min_frias: int = 3,
     min_quentes: int = 4,
-) -> Dict[str, Any]:
+):
     """
-    Gera N jogos (FGIs) usando o motor com score, baseado
-    na ÚLTIMA janela carregada em /carregar.
-
-    Parâmetros:
-      - n: quantidade de jogos (default 32)
-      - min_frias: mínimo de dezenas frias por jogo
-      - min_quentes: mínimo de dezenas quentes por jogo
-
-    Exemplo de uso:
-
-      GET /gerar_fino?n=32&min_frias=5&min_quentes=4
+    Gera N FGIs usando o score tradicional...
+    + ORDENA tudo pela MATURAÇÃO.
     """
+    global motor, HISTORICO
+
     if motor is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Nenhum concurso carregado. Chame /carregar antes.",
-        )
+        raise HTTPException(status_code=400, detail="Use /carregar antes.")
 
+    # 1) FGIs base do motor
+    jogos = motor.gerar_fino(
+        n=n,
+        min_frias=min_frias,
+        min_quentes=min_quentes
+    )
+
+    # ===========================
+    # 2) MATRIZ DE MATURAÇÃO
+    # ===========================
     try:
-        jogos = motor.gerar_fino(
-            n=n,
-            min_frias=min_frias,
-            min_quentes=min_quentes,
+        mapa_maturacao = calcular_maturacao(
+            HISTORICO,
+            janela_longa=25,
+            janela_curta=10
         )
-        return {
-            "status": "ok",
-            "quantidade": len(jogos),
-            "jogos": jogos,
-        }
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"erro interno: {e}")
+        print("Erro na maturação:", e)
+        mapa_maturacao = {}
+
+    # ===========================
+    # 3) SCORE DE MATURAÇÃO
+    # ===========================
+    jogos_com_score = []
+    for j in jogos:
+        s = score_maturacao_jogo(j, mapa_maturacao)
+        jogos_com_score.append((s, j))
+
+    # Ordena por maturação (maior score primeiro)
+    jogos_ordenados = [j for (s, j) in sorted(jogos_com_score, key=lambda x: x[0], reverse=True)]
+
+    return {
+        "status": "ok",
+        "quantidade": len(jogos_ordenados),
+        "jogos": jogos_ordenados
+    }
 
 
-# -------------------------
-# /ultimos25.csv
-# -------------------------
+# ======================================
+#   GET /ultimos25.csv  (para Excel)
+# ======================================
+@app.get("/ultimos25.csv")
+async def baixar_csv():
+    if motor is None:
+        return PlainTextResponse("ERRO: carregue concursos primeiro.")
 
+    linhas = []
+    for conc in HISTORICO[-25:]:
+        linha = ",".join(str(x) for x in conc)
+        linhas.append(linha)
 
-@app.get("/ultimos25.csv", response_class=PlainTextResponse)
-def ultimos_25_csv() -> str:
-    """
-    Exporta os últimos 25 concursos carregados EM MEMÓRIA
-    (ou menos, se tiver menos carregados) em formato CSV.
-
-    - Baseado em motor.concursos (ordem em que foram carregados).
-    - Separador: ponto e vírgula (;)
-
-    Cabeçalho:
-      concurso;d1;d2;...;d15
-    """
-    if motor is None or not getattr(motor, "concursos", None):
-        raise HTTPException(
-            status_code=400,
-            detail="Nenhum concurso carregado. Chame /carregar antes.",
-        )
-
-    concursos = motor.concursos
-    qtd = min(25, len(concursos))
-    ultimos = concursos[-qtd:]
-
-    buffer = StringIO()
-    writer = csv.writer(buffer, delimiter=";")
-
-    # Cabeçalho
-    header = ["concurso"] + [f"d{i}" for i in range(1, 16)]
-    writer.writerow(header)
-
-    primeiro_idx = len(concursos) - qtd + 1
-
-    # Linhas
-    for idx, jogo in enumerate(ultimos):
-        row = [primeiro_idx + idx] + list(jogo)
-        writer.writerow(row)
-
-    csv_str = buffer.getvalue()
-    buffer.close()
-
-    return csv_str
+    conteudo = "\n".join(linhas)
+    return PlainTextResponse(conteudo, media_type="text/csv")
