@@ -1,61 +1,96 @@
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-import yaml
-import os
+  # Distribuição 1–13 vs 14–25
+        # ----------------------------------------------------
+        c_1_13 = sum(1 for x in seq if 1 <= x <= 13)
+        c_14_25 = len(seq) - c_1_13
 
-# ============================================================
-#  LOAD DO ARQUIVO lab_config.yaml
-# ============================================================
+        ok_1_13 = constraints.min_1_13 <= c_1_13 <= constraints.max_1_13
+        ok_14_25 = constraints.min_14_25 <= c_14_25 <= constraints.max_14_25
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-LAB_CONFIG_PATH = os.path.join(BASE_DIR, "lab_config.yaml")
+        detalhes["faixa_1_13_14_25"] = {
+            "contagem_1_13": c_1_13,
+            "contagem_14_25": c_14_25,
+            "min_1_13": constraints.min_1_13,
+            "max_1_13": constraints.max_1_13,
+            "min_14_25": constraints.min_14_25,
+            "max_14_25": constraints.max_14_25,
+            "coerente_1_13": ok_1_13,
+            "coerente_14_25": ok_14_25,
+        }
 
-if not os.path.exists(LAB_CONFIG_PATH):
-    raise FileNotFoundError(
-        f"Arquivo de configuração não encontrado: {LAB_CONFIG_PATH}"
-    )
+        coerencias += int(ok_1_13) + int(ok_14_25)
+        violacoes += int(not ok_1_13) + int(not ok_14_25)
 
-with open(LAB_CONFIG_PATH, "r", encoding="utf-8") as f:
-    LAB_CONFIG = yaml.safe_load(f)
+        # ----------------------------------------------------
+        # Números bloqueados
+        # ----------------------------------------------------
+        bloqueados_presentes = [x for x in seq if x in constraints.numeros_bloqueados]
+        detalhes["numeros_bloqueados"] = {
+            "bloqueados": list(constraints.numeros_bloqueados),
+            "presentes_na_seq": bloqueados_presentes,
+        }
+        if bloqueados_presentes:
+            violacoes += len(bloqueados_presentes)
+        else:
+            # se não há bloqueados na sequência, conta como 1 coerência
+            coerencias += 1
 
-# ============================================================
-#  FASTAPI APP
-# ============================================================
+        # ----------------------------------------------------
+        # Pares proibidos
+        # ----------------------------------------------------
+        pares = {
+            (min(a, b), max(a, b))
+            for i, a in enumerate(seq)
+            for b in seq[i + 1 :]
+        }
+        pares_proibidos_usados = [
+            p for p in pares if p in constraints.pares_proibidos
+        ]
+        detalhes["pares_proibidos"] = {
+            "proibidos": [list(p) for p in constraints.pares_proibidos],
+            "presentes_na_seq": [list(p) for p in pares_proibidos_usados],
+        }
+        if pares_proibidos_usados:
+            violacoes += len(pares_proibidos_usados)
+        else:
+            coerencias += 1
 
-app = FastAPI(
-    title="ATHENAH LABORATORIO PMFC",
-    description="Backend do MotorFGI + PONTO C + Config YAML",
-    version="0.1.0",
-)
+        # ----------------------------------------------------
+        # Trios proibidos (ainda vazio, mas estrutura pronta)
+        # ----------------------------------------------------
+        trios = {
+            tuple(sorted((a, b, c)))
+            for i, a in enumerate(seq)
+            for j, b in enumerate(seq[i + 1 :], start=i + 1)
+            for c in seq[j + 1 :]
+        }
+        trios_proibidos_usados = [
+            t for t in trios if t in constraints.trios_proibidos
+        ]
+        detalhes["trios_proibidos"] = {
+            "proibidos": [list(t) for t in constraints.trios_proibidos],
+            "presentes_na_seq": [list(t) for t in trios_proibidos_usados],
+        }
+        if trios_proibidos_usados:
+            violacoes += len(trios_proibidos_usados)
+        else:
+            coerencias += 1
 
-# ============================================================
-#  ENDPOINT: Retorna o YAML carregado
-# ============================================================
+        # ----------------------------------------------------
+        # Score total simples
+        # ----------------------------------------------------
+        score_total = float(coerencias - violacoes)
 
-@app.get("/lab/config")
-def get_lab_config():
-    """
-    Retorna o conteúdo completo do arquivo lab_config.yaml
-    como JSON.
-    """
-    return JSONResponse(content=LAB_CONFIG)
+        return ScoreDetalhado(
+            score_total=score_total,
+            coerencias=coerencias,
+            violacoes=violacoes,
+            detalhes=detalhes,
+        )
 
-# ============================================================
-#  ENDPOINT DE STATUS (opcional)
-# ============================================================
 
-@app.get("/lab/status")
-def status():
-    return {
-        "status": "online",
-        "versao_laboratorio": LAB_CONFIG.get("versao_laboratorio", "desconhecida")
-    }
-
-# ============================================================
-#  OBSERVAÇÃO
-# ============================================================
-# O restante do laboratório (motor FGI, Ponto C, metodologias etc.)
-# será acoplado nos próximos passos. Aqui você já tem:
-#   ✔ leitura automática do lab_config.yaml
-#   ✔ endpoint /lab/config funcionando
-#   ✔ estrutura limpa e completa sem depender de código prévio
+# Pequeno teste manual (não será executado no Render, mas ajuda localmente)
+if __name__ == "__main__":
+    engine = PontoCEngine()
+    exemplo_seq = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 22, 23, 24, 25]
+    resultado = engine.score_sequence(exemplo_seq, regime_id="R2")
+    print("Score exemplo:", resultado)
