@@ -1,11 +1,12 @@
 # grupo_de_milhoes.py
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator, List, Optional, Sequence, Set, Dict
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 import csv
 import itertools
+import random
 
 
 def _as_int_list(values: Iterable[str]) -> List[int]:
@@ -22,45 +23,49 @@ def _as_int_list(values: Iterable[str]) -> List[int]:
     return out
 
 
-def _norm_seq(seq: Sequence[int]) -> tuple[int, ...]:
-    # normaliza como tupla ordenada crescente, sem duplicatas
-    s = sorted({int(x) for x in seq if x is not None})
-    return tuple(s)
+def _norm_seq(seq: Sequence[int]) -> Tuple[int, ...]:
+    # normaliza como tupla ordenada crescente, sem duplicatas e sem None
+    return tuple(sorted({int(x) for x in seq if x is not None}))
 
 
 @dataclass
 class GrupoDeMilhoes:
     """
-    Grupo de Milhões = universo de combinações que ainda NÃO aconteceram.
+    Grupo de Milhões = universo de combinações que AINDA NÃO aconteceram.
 
-    Implementação prática:
     - Universo padrão: 1..25 (Lotofácil)
-    - Lê um CSV histórico (opcional) e registra as sequências já sorteadas
+    - Lê um CSV histórico (opcional) e registra as sequências já sorteadas por tamanho k
     - Gera combinações (itertools.combinations) e filtra as que já saíram
     - Entrega candidatos via get_candidatos(k, max_candidatos)
 
-    Observação importante:
+    Observações:
     - O histórico só exclui sequências do mesmo tamanho k.
-      Ex.: se seu CSV tem 15 dezenas por concurso, ele exclui apenas k=15.
+    - NÃO pré-gera milhões no boot. Tudo é sob demanda.
+    - auto_generate existe pra compatibilidade com MotorFGI (não explode RAM).
     """
 
     universo_max: int = 25
     historico_csv: Optional[Path] = None
+    auto_generate: bool = False
 
-    # interno
-    _sorteadas_por_k: Dict[int, Set[frozenset[int]]] = None  # type: ignore
+    # interno: mapeia k -> set de sequências sorteadas (frozenset)
+    _sorteadas_por_k: Dict[int, Set[frozenset[int]]] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
-        self._sorteadas_por_k = {}
         if self.historico_csv is not None:
             self._carregar_historico(self.historico_csv)
 
-    # -----------------------------
+        # Compat: se alguém passar auto_generate=True, não pré-calcula milhões.
+        # Só garante que o histórico (se existir) foi carregado.
+        if self.auto_generate:
+            _ = self.total_sorteadas()
+
+    # ----------------------------
     # Histórico
-    # -----------------------------
+    # ----------------------------
     def _carregar_historico(self, path: Path) -> None:
         if not path.exists():
-            raise FileNotFoundError(f"CSV não encontrado: {path}")
+            raise FileNotFoundError(f"csv não encontrado: {path}")
 
         with path.open("r", encoding="utf-8", newline="") as f:
             reader = csv.reader(f)
@@ -69,87 +74,140 @@ class GrupoDeMilhoes:
             except StopIteration:
                 return
 
-            header_lower = [h.strip().lower() for h in header]
+            header_lower = [(h or "").strip().lower() for h in header]
 
             # tenta detectar colunas de dezenas (dez1..dez15 etc)
+            # pega colunas cujo nome contenha "dez" ou seja numérico tipo "1","2"... (alguns CSVs vêm assim)
             dez_idxs: List[int] = []
             for i, h in enumerate(header_lower):
-                # padrões comuns: "dez", "dezena", "d1", "n1", etc
-                if h.startswith("dez") or h.startswith("d") or h.startswith("n"):
+                if (
+                    "dez" in h
+                    or h.startswith("d")
+                    or h.isdigit()
+                    or h in {"bola1", "bola2", "bola3", "bola4", "bola5", "bola6"}
+                ):
                     dez_idxs.append(i)
 
             for row in reader:
                 if not row or all((c or "").strip() == "" for c in row):
                     continue
 
-                if len(dez_idxs) >= 10:
-                    nums = _as_int_list(row[i] for i in dez_idxs)
+                nums: List[int] = []
+
+                if dez_idxs:
+                    # usa colunas detectadas
+                    for i in dez_idxs:
+                        if i >= len(row):
+                            continue
+                        try:
+                            v = int(str(row[i]).strip())
+                        except Exception:
+                            continue
+                        if 1 <= v <= self.universo_max:
+                            nums.append(v)
                 else:
-                    # fallback: tenta varrer a linha inteira e pegar só números no range 1..universo
-                    nums_all = _as_int_list(row)
-                    nums = [x for x in nums_all if 1 <= x <= self.universo_max]
+                    # fallback: extrai todos inteiros da linha e filtra no range
+                    nums = []
+                    for cell in row:
+                        cell = (cell or "").strip()
+                        if not cell:
+                            continue
+                        try:
+                            v = int(cell)
+                        except Exception:
+                            continue
+                        if 1 <= v <= self.universo_max:
+                            nums.append(v)
 
                 seq = _norm_seq(nums)
-                if not seq:
+                k = len(seq)
+                if k <= 0:
                     continue
 
-                k = len(seq)
                 self._sorteadas_por_k.setdefault(k, set()).add(frozenset(seq))
 
-    def total_sorteadas(self, k: int) -> int:
-        return len(self._sorteadas_por_k.get(int(k), set()))
+    def total_sorteadas(self, k: Optional[int] = None) -> int:
+        if k is None:
+            return sum(len(s) for s in self._sorteadas_por_k.values())
+        return len(self._sorteadas_por_k.get(k, set()))
 
-    # -----------------------------
-    # Núcleo: geração do grupo
-    # -----------------------------
-    def gerar_combinacoes(self, k: int) -> Iterator[tuple[int, ...]]:
+    # ----------------------------
+    # Universo / geração
+    # ----------------------------
+    def gerar_combinacoes(self, k: int) -> Iterator[Tuple[int, ...]]:
         """
-        Gera combinações do universo (1..universo_max) de tamanho k,
-        filtrando as que já saíram (se houver histórico carregado).
+        Gera todas as combinações do universo 1..universo_max com tamanho k.
         """
-        k = int(k)
-        if k <= 0 or k > self.universo_max:
-            raise ValueError(f"k inválido: {k}. Esperado 1..{self.universo_max}")
-
-        ja_saiu = self._sorteadas_por_k.get(k, set())
-
         universo = range(1, self.universo_max + 1)
-        for comb in itertools.combinations(universo, k):
-            if ja_saiu and frozenset(comb) in ja_saiu:
-                continue
-            yield comb
+        return itertools.combinations(universo, k)
 
-    # -----------------------------
-    # Interface esperada pelo MotorFGI
-    # -----------------------------
-    def get_candidatos(self, k: int, max_candidatos: int) -> List[List[int]]:
+    def _ja_saiu(self, seq: Sequence[int]) -> bool:
+        seq_norm = _norm_seq(seq)
+        k = len(seq_norm)
+        if k <= 0:
+            return False
+        return frozenset(seq_norm) in self._sorteadas_por_k.get(k, set())
+
+    # ----------------------------
+    # API principal
+    # ----------------------------
+    def get_candidatos(
+        self,
+        k: int,
+        max_candidatos: int = 2000,
+        shuffle: bool = False,
+        seed: Optional[int] = None,
+    ) -> List[List[int]]:
         """
-        CONTRATO DO MotorFGI:
-        retorna até max_candidatos sequências (listas de int) de tamanho k,
-        vindas do Grupo de Milhões (combinações ainda não sorteadas).
+        Retorna até max_candidatos combinações de tamanho k que AINDA NÃO saíram no histórico.
+
+        - shuffle=False: pega as primeiras válidas em ordem lexicográfica
+        - shuffle=True: amostra aleatória (sem percorrer tudo quando possível)
         """
-        k = int(k)
-        max_candidatos = int(max_candidatos)
+        if not (1 <= k <= self.universo_max):
+            raise ValueError(f"k inválido: {k} (esperado 1..{self.universo_max})")
+
         if max_candidatos <= 0:
             return []
 
-        candidatos: List[List[int]] = []
-        for comb in self.gerar_combinacoes(k):
-            candidatos.append(list(comb))
-            if len(candidatos) >= max_candidatos:
-                break
+        sorteadas = self._sorteadas_por_k.get(k, set())
 
-        return candidatos
+        # Modo determinístico: streaming e corte
+        if not shuffle:
+            out: List[List[int]] = []
+            for comb in self.gerar_combinacoes(k):
+                if frozenset(comb) in sorteadas:
+                    continue
+                out.append(list(comb))
+                if len(out) >= max_candidatos:
+                    break
+            return out
 
+        # Modo aleatório:
+        rng = random.Random(seed)
 
-# -----------------------------
-# Teste rápido local
-# -----------------------------
-if __name__ == "__main__":
-    # ajuste o caminho se quiser testar com histórico real
-    hist = Path("lotofacil_ultimos_25_concursos.csv")
-    gm = GrupoDeMilhoes(universo_max=25, historico_csv=hist if hist.exists() else None)
+        # Para universo pequeno (Lotofácil), ainda é viável fazer amostragem por tentativas.
+        # Evita materializar o universo inteiro.
+        out_set: Set[Tuple[int, ...]] = set()
+        tentativas = 0
+        limite_tentativas = max_candidatos * 200  # segura pra não travar se estiver “apertado”
 
-    print("sorteadas k=15:", gm.total_sorteadas(15))
-    cands = gm.get_candidatos(k=20, max_candidatos=5)
-    print("amostra k=20:", cands)
+        while len(out_set) < max_candidatos and tentativas < limite_tentativas:
+            tentativas += 1
+            comb = tuple(sorted(rng.sample(range(1, self.universo_max + 1), k)))
+            if frozenset(comb) in sorteadas:
+                continue
+            out_set.add(comb)
+
+        return [list(t) for t in out_set]
+
+    # ----------------------------
+    # Utilitários
+    # ----------------------------
+    def info(self) -> dict:
+        return {
+            "universo_max": self.universo_max,
+            "historico_csv": str(self.historico_csv) if self.historico_csv else None,
+            "total_sorteadas": self.total_sorteadas(),
+            "sorteadas_por_k": {str(k): len(v) for k, v in sorted(self._sorteadas_por_k.items())},
+            }
