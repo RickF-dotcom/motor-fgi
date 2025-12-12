@@ -3,7 +3,6 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
-
 from pathlib import Path
 import yaml
 
@@ -11,22 +10,28 @@ from fgi_engine import MotorFGI
 from regime_detector import RegimeDetector
 
 
+# =========================
+# App
+# =========================
+
 app = FastAPI(
-    title="ATHENAH LABORATORIO PMFC",
-    version="0.1.0",
-    description="Backend do MotorFGI + PONTO C + Config YAML. Laboratório de engenharia de padrões.",
+    title="ATHENA LABORATORIO PMF",
+    version="0.2.0",
+    description="Backend do MotorFGI + PONTO C + RegimeDetector (DNA + regime).",
 )
 
-
-# ==============================
+# =========================
 # Paths / Config
-# ==============================
+# =========================
 
 BASE_DIR = Path(__file__).resolve().parent
 LAB_CONFIG_PATH = BASE_DIR / "lab_config.yaml"
 
 DNA_LAST25_PATH = BASE_DIR / "dna_last25.yaml"
 HISTORICO_LAST25_CSV = BASE_DIR / "lotofacil_ultimos_25_concursos.csv"
+
+# opcional: se você subir um CSV do histórico completo no repo, ele vira baseline REAL
+HISTORICO_TOTAL_CSV = BASE_DIR / "lotofacil_historico_completo.csv"
 
 
 def _load_yaml(path: Path) -> Dict[str, Any]:
@@ -45,20 +50,27 @@ try:
 except Exception:
     LAB_CONFIG = {}
 
+# =========================
+# Motor
+# =========================
 
-# ==============================
-# Request models
-# ==============================
+motor_fgi = MotorFGI()
+
+
+# =========================
+# Request Models
+# =========================
 
 class PrototipoRequest(BaseModel):
     k: int = 5
     regime_id: Optional[str] = "R2"
     max_candidatos: Optional[int] = 2000
+    incluir_contexto_dna: bool = True
 
 
-# ==============================
-# Health / Config endpoints
-# ==============================
+# =========================
+# Endpoints básicos
+# =========================
 
 @app.get("/lab/config")
 def get_lab_config():
@@ -73,77 +85,86 @@ def status():
     }
 
 
-# ==============================
-# FGI endpoint - protótipos
-# ==============================
-
-@app.post("/prototipos")
-def gerar_prototipos(req: PrototipoRequest):
-    """
-    Gera protótipos estruturais (LHEs/FGIs) usando:
-    - MotorFGI (decoder)
-    - PontoCEngine (constraints + score)
-    - Grupo de Milhões (combinações não sorteadas)
-    """
-    try:
-        motor = MotorFGI()
-        prototipos = motor.gerar_prototipos_json(
-            k=req.k,
-            regime_id=req.regime_id,
-            max_candidatos=req.max_candidatos,
-            incluir_contexto_dna=True,
-        )
-        return prototipos
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro interno: {e}")
-
-
-# ==============================
-# LAB - DNA e Regime (Passo C)
-# ==============================
-
-def _assert_lab_files():
-    if not DNA_LAST25_PATH.exists():
-        raise HTTPException(status_code=500, detail="Arquivo dna_last25.yaml não encontrado")
-    if not HISTORICO_LAST25_CSV.exists():
-        raise HTTPException(status_code=500, detail="Arquivo lotofacil_ultimos_25_concursos.csv não encontrado")
-
+# =========================
+# Laboratório: DNA e Regime
+# =========================
 
 @app.get("/lab/dna_last25")
 def lab_dna_last25():
     """
     Retorna o DNA estrutural calculado a partir das últimas 25 sequências reais.
     """
-    _assert_lab_files()
-
-    detector = RegimeDetector(
-        dna_path=DNA_LAST25_PATH,
-        historico_csv=HISTORICO_LAST25_CSV,
-    )
-
-    dna = detector.extrair_dna()
-    return {"origem": "ultimos_25_concursos", "dna": dna}
+    try:
+        detector = RegimeDetector(
+            dna_path=DNA_LAST25_PATH,
+            historico_csv=HISTORICO_LAST25_CSV,
+            historico_total_csv=HISTORICO_TOTAL_CSV if HISTORICO_TOTAL_CSV.exists() else None,
+        )
+        dna = detector.extrair_dna()
+        return {"origem": "ultimos_25_concursos", "dna": dna}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/lab/regime_atual")
 def lab_regime_atual():
     """
-    Diagnóstico do regime atual baseado no DNA + histórico das últimas 25.
+    Diagnóstico do regime atual baseado em:
+      - DNA(25) das últimas 25
+      - baseline macro (histórico total se disponível; senão fallback)
     """
-    _assert_lab_files()
+    try:
+        detector = RegimeDetector(
+            dna_path=DNA_LAST25_PATH,
+            historico_csv=HISTORICO_LAST25_CSV,
+            historico_total_csv=HISTORICO_TOTAL_CSV if HISTORICO_TOTAL_CSV.exists() else None,
+        )
+        regime = detector.detectar_regime()
+        return {"regime_atual": regime}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    detector = RegimeDetector(
-        dna_path=DNA_LAST25_PATH,
-        historico_csv=HISTORICO_LAST25_CSV,
-    )
 
-    regime = detector.detectar_regime()
-    return {
-        "regime_atual": {
-            "regime_id": regime.regime_id,
-            "score_regime": regime.score_regime,
-            "diagnostico": regime.diagnostico,
+# =========================
+# Endpoint principal: protótipos
+# =========================
+
+@app.post("/prototipos")
+def gerar_prototipos(req: PrototipoRequest):
+    """
+    Gera protótipos estruturais (LHE/LHS) usando:
+      - MotorFGI (decoder + score)
+      - Grupo de Milhões (combinações não sorteadas)
+    E injeta contexto do laboratório (DNA + regime) se solicitado.
+    """
+    try:
+        # gera protótipos do motor
+        out = motor_fgi.gerar_prototipos_json(
+            k=req.k,
+            regime_id=req.regime_id,
+            max_candidatos=req.max_candidatos,
+            incluir_contexto_dna=False,  # vamos controlar aqui fora
+        )
+
+        if not req.incluir_contexto_dna:
+            return out
+
+        # injeta contexto do laboratório
+        detector = RegimeDetector(
+            dna_path=DNA_LAST25_PATH,
+            historico_csv=HISTORICO_LAST25_CSV,
+            historico_total_csv=HISTORICO_TOTAL_CSV if HISTORICO_TOTAL_CSV.exists() else None,
+        )
+        dna = detector.extrair_dna()
+        regime = detector.detectar_regime()
+
+        out["contexto_lab"] = {
+            "dna_last25": dna,
+            "regime_atual": regime,
         }
-    }
+        return out
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro interno: {e}")
