@@ -1,164 +1,155 @@
 # grupo_de_milhoes.py
-#
-# Responsável por manter o "grupo de milhões":
-# - universo total de combinações 15/25 (3.268.760 jogos)
-# - MENOS todas as combinações já sorteadas
-#   (vindas do historico sequencia_real.csv, se existir)
-# - MENOS os concursos que você enviar via /carregar
-#
-# A API usada pelo FGIMotor:
-#   - GrupoDeMilhoes()
-#   - remover_sorteadas(concursos)
-#   - sample(n)  -> devolve n jogos (listas de dezenas)
-
 from __future__ import annotations
 
-from itertools import combinations
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, Iterator, List, Optional, Sequence, Set, Dict
 import csv
-import os
-import pickle
-import random
+import itertools
 
 
-ARQUIVO_PADRAO = "grupo_de_milhoes.pkl"
-HISTORICO_CSV = Path(__file__).parent / "sequencia_real.csv"
-
-
-class GrupoDeMilhoes:
-    def __init__(self, arquivo: str = ARQUIVO_PADRAO, auto_generate: bool = True):
-        self.arquivo = arquivo
-        self.combos: List[int] = []
-
-        # 1) tenta carregar do .pkl
-        if os.path.exists(self.arquivo):
-            self._load()
-        else:
-            # 2) se não existir, pode gerar universo total
-            if auto_generate:
-                self._gerar_universo_total()
-            else:
-                self.combos = []
-
-        # 3) se existir histórico em CSV, remove sorteadas do universo
-        if self.combos and HISTORICO_CSV.exists():
-            self._remover_sorteadas_de_csv()
-
-    # ----------------------------------------
-    # Codificação: jogo -> bitmask (25 bits)
-    # ----------------------------------------
-    @staticmethod
-    def _encode(jogo: Iterable[int]) -> int:
-        mask = 0
-        for d in jogo:
-            if not 1 <= d <= 25:
-                raise ValueError(f"Dezena inválida: {d}")
-            mask |= 1 << (d - 1)
-        return mask
-
-    @staticmethod
-    def _decode(mask: int) -> List[int]:
-        return [d + 1 for d in range(25) if mask & (1 << d)]
-
-    # ----------------------------------------
-    # Persistência
-    # ----------------------------------------
-    def _save(self) -> None:
-        with open(self.arquivo, "wb") as f:
-            pickle.dump(self.combos, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-    def _load(self) -> None:
-        with open(self.arquivo, "rb") as f:
-            self.combos = pickle.load(f)
-
-    # ----------------------------------------
-    # Universo total
-    # ----------------------------------------
-    def _gerar_universo_total(self) -> None:
-        """
-        Gera TODAS as combinações de 15 dezenas entre 1..25.
-        Tamanho: 3.268.760 combinações.
-        Roda uma vez, salva em grupo_de_milhoes.pkl.
-        """
-        combos: List[int] = []
-        for comb in combinations(range(1, 26), 15):
-            combos.append(self._encode(comb))
-
-        self.combos = combos
-        self._save()
-
-    # ----------------------------------------
-    # Remoção de sorteadas (via CSV histórico)
-    # ----------------------------------------
-    def _remover_sorteadas_de_csv(self) -> None:
-        """
-        Lê o sequencia_real.csv (se existir) e remove TODAS
-        as combinações já sorteadas do universo.
-        """
-        base = set(self.combos)
-        alterou = False
-
+def _as_int_list(values: Iterable[str]) -> List[int]:
+    out: List[int] = []
+    for v in values:
+        v = (v or "").strip()
+        if not v:
+            continue
         try:
-            with HISTORICO_CSV.open("r", newline="", encoding="utf-8") as f:
-                reader = csv.reader(f)
-                for row in reader:
-                    nums = [c.strip() for c in row if c.strip()]
-                    if not nums:
-                        continue
-                    dezenas = [int(x) for x in nums[:15]]
-                    dezenas_validas = [d for d in dezenas if 1 <= d <= 25]
-                    if len(dezenas_validas) != 15:
-                        continue
-                    mask = self._encode(dezenas_validas)
-                    if mask in base:
-                        base.remove(mask)
-                        alterou = True
+            out.append(int(v))
         except Exception:
-            # se der erro de leitura, não mata o servidor; só segue com o que tem
-            return
+            # ignora lixo
+            continue
+    return out
 
-        if alterou:
-            self.combos = list(base)
-            self._save()
 
-    # ----------------------------------------
-    # Remoção incremental (via /carregar)
-    # ----------------------------------------
-    def remover_sorteadas(self, concursos: List[List[int]]) -> None:
+def _norm_seq(seq: Sequence[int]) -> tuple[int, ...]:
+    # normaliza como tupla ordenada crescente, sem duplicatas
+    s = sorted({int(x) for x in seq if x is not None})
+    return tuple(s)
+
+
+@dataclass
+class GrupoDeMilhoes:
+    """
+    Grupo de Milhões = universo de combinações que ainda NÃO aconteceram.
+
+    Implementação prática:
+    - Universo padrão: 1..25 (Lotofácil)
+    - Lê um CSV histórico (opcional) e registra as sequências já sorteadas
+    - Gera combinações (itertools.combinations) e filtra as que já saíram
+    - Entrega candidatos via get_candidatos(k, max_candidatos)
+
+    Observação importante:
+    - O histórico só exclui sequências do mesmo tamanho k.
+      Ex.: se seu CSV tem 15 dezenas por concurso, ele exclui apenas k=15.
+    """
+
+    universo_max: int = 25
+    historico_csv: Optional[Path] = None
+
+    # interno
+    _sorteadas_por_k: Dict[int, Set[frozenset[int]]] = None  # type: ignore
+
+    def __post_init__(self) -> None:
+        self._sorteadas_por_k = {}
+        if self.historico_csv is not None:
+            self._carregar_historico(self.historico_csv)
+
+    # -----------------------------
+    # Histórico
+    # -----------------------------
+    def _carregar_historico(self, path: Path) -> None:
+        if not path.exists():
+            raise FileNotFoundError(f"CSV não encontrado: {path}")
+
+        with path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
+            try:
+                header = next(reader)
+            except StopIteration:
+                return
+
+            header_lower = [h.strip().lower() for h in header]
+
+            # tenta detectar colunas de dezenas (dez1..dez15 etc)
+            dez_idxs: List[int] = []
+            for i, h in enumerate(header_lower):
+                # padrões comuns: "dez", "dezena", "d1", "n1", etc
+                if h.startswith("dez") or h.startswith("d") or h.startswith("n"):
+                    dez_idxs.append(i)
+
+            for row in reader:
+                if not row or all((c or "").strip() == "" for c in row):
+                    continue
+
+                if len(dez_idxs) >= 10:
+                    nums = _as_int_list(row[i] for i in dez_idxs)
+                else:
+                    # fallback: tenta varrer a linha inteira e pegar só números no range 1..universo
+                    nums_all = _as_int_list(row)
+                    nums = [x for x in nums_all if 1 <= x <= self.universo_max]
+
+                seq = _norm_seq(nums)
+                if not seq:
+                    continue
+
+                k = len(seq)
+                self._sorteadas_por_k.setdefault(k, set()).add(frozenset(seq))
+
+    def total_sorteadas(self, k: int) -> int:
+        return len(self._sorteadas_por_k.get(int(k), set()))
+
+    # -----------------------------
+    # Núcleo: geração do grupo
+    # -----------------------------
+    def gerar_combinacoes(self, k: int) -> Iterator[tuple[int, ...]]:
         """
-        Remove do grupo todas as combinações que já saíram.
-        Pode ser chamado várias vezes (incremental).
+        Gera combinações do universo (1..universo_max) de tamanho k,
+        filtrando as que já saíram (se houver histórico carregado).
         """
-        if not self.combos:
-            return
+        k = int(k)
+        if k <= 0 or k > self.universo_max:
+            raise ValueError(f"k inválido: {k}. Esperado 1..{self.universo_max}")
 
-        base = set(self.combos)
-        alterou = False
+        ja_saiu = self._sorteadas_por_k.get(k, set())
 
-        for jogo in concursos:
-            dezenas_validas = [d for d in jogo if 1 <= d <= 25]
-            if len(dezenas_validas) != 15:
+        universo = range(1, self.universo_max + 1)
+        for comb in itertools.combinations(universo, k):
+            if ja_saiu and frozenset(comb) in ja_saiu:
                 continue
-            mask = self._encode(dezenas_validas)
-            if mask in base:
-                base.remove(mask)
-                alterou = True
+            yield comb
 
-        if alterou:
-            self.combos = list(base)
-            self._save()
-
-    # ----------------------------------------
-    # Amostragem para o motor
-    # ----------------------------------------
-    def sample(self, n: int) -> List[List[int]]:
+    # -----------------------------
+    # Interface esperada pelo MotorFGI
+    # -----------------------------
+    def get_candidatos(self, k: int, max_candidatos: int) -> List[List[int]]:
         """
-        Retorna n jogos distintos do grupo (em forma de listas de dezenas).
+        CONTRATO DO MotorFGI:
+        retorna até max_candidatos sequências (listas de int) de tamanho k,
+        vindas do Grupo de Milhões (combinações ainda não sorteadas).
         """
-        if not self.combos:
+        k = int(k)
+        max_candidatos = int(max_candidatos)
+        if max_candidatos <= 0:
             return []
 
-        n = min(n, len(self.combos))
-        indices = random.sample(range(len(self.combos)), n)
-        return [self._decode(self.combos[i]) for i in indices]
+        candidatos: List[List[int]] = []
+        for comb in self.gerar_combinacoes(k):
+            candidatos.append(list(comb))
+            if len(candidatos) >= max_candidatos:
+                break
+
+        return candidatos
+
+
+# -----------------------------
+# Teste rápido local
+# -----------------------------
+if __name__ == "__main__":
+    # ajuste o caminho se quiser testar com histórico real
+    hist = Path("lotofacil_ultimos_25_concursos.csv")
+    gm = GrupoDeMilhoes(universo_max=25, historico_csv=hist if hist.exists() else None)
+
+    print("sorteadas k=15:", gm.total_sorteadas(15))
+    cands = gm.get_candidatos(k=20, max_candidatos=5)
+    print("amostra k=20:", cands)
