@@ -1,219 +1,147 @@
+# grupo_de_milhoes.py
 from __future__ import annotations
 
-import os
-import yaml
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+import csv
+import itertools
 
-from grupo_de_milhoes import GrupoDeMilhoes
-from ponto_c_engine import PontoCEngine, ScoreDetalhado
+
+def _as_int_list(values: Iterable[str]) -> List[int]:
+    out: List[int] = []
+    for v in values:
+        v = (v or "").strip()
+        if not v:
+            continue
+        try:
+            out.append(int(v))
+        except Exception:
+            # ignora lixo
+            continue
+    return out
 
 
-# ==========================================================
-# Estrutura de saída: Protótipo (LHE / FGI estrutural)
-# ==========================================================
+def _norm_seq(seq: Sequence[int]) -> Tuple[int, ...]:
+    # normaliza como tupla ordenada crescente, sem duplicatas
+    return tuple(sorted({int(x) for x in seq if x is not None}))
+
+
 @dataclass
-class Prototipo:
-    sequencia: List[int]
-    score_total: float
-    coerencias: int
-    violacoes: int
-    detalhes: Dict[str, Any]
-
-
-# ==========================================================
-# Util: caminhos e carga de YAML
-# ==========================================================
-BASE_DIR = Path(__file__).resolve().parent
-LAB_CONFIG_PATH = BASE_DIR / "lab_config.yaml"
-DNA_LAST25_PATH = BASE_DIR / "dna_last25.yaml"
-
-
-def _load_yaml(path: Path) -> Dict[str, Any]:
-    if not path.exists():
-        raise FileNotFoundError(f"Arquivo não encontrado: {path}")
-    with path.open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    if not isinstance(data, dict):
-        raise ValueError(f"YAML inválido (esperado dict no topo): {path}")
-    return data
-
-
-def _load_yaml_optional(path: Path) -> Dict[str, Any]:
-    if not path.exists():
-        return {}
-    with path.open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    return data if isinstance(data, dict) else {}
-
-
-# ==========================================================
-# MotorFGI (Decoder do PONTO C + Grupo de Milhões + DNA)
-# ==========================================================
-class MotorFGI:
+class GrupoDeMilhoes:
     """
-    MotorFGI v0.2 (com DNA opcional)
+    Grupo de Milhões = universo de combinações que ainda NÃO aconteceram.
 
-    Papel:
-      - Consome o GrupoDeMilhoes (combinações não sorteadas)
-      - Usa PontoCEngine para calcular coerência/violação por regime
-      - Ordena e devolve protótipos estruturais (LHEs)
-      - Injeta DNA (últimos 25) como "contexto de calibração" (não bloqueia nada ainda)
-        -> neste estágio, DNA entra como METADADO e parâmetro de ajuste futuro
+    - Universo padrão: 1..25 (Lotofácil)
+    - Lê um CSV histórico (opcional) e registra as sequências já sorteadas
+    - Gera combinações (itertools.combinations) e filtra as já sorteadas
+    - Entrega candidatos via get_candidatos(k, limite)
+
+    Observação importante:
+    - O histórico exclui sequências do MESMO tamanho k.
+      Ex.: se seu CSV tem concursos de 15 dezenas, ele exclui apenas k=15.
     """
 
-    def __init__(
-        self,
-        ponto_c: Optional[PontoCEngine] = None,
-        grupo: Optional[GrupoDeMilhoes] = None,
-        regime_id_padrao: Optional[str] = None,
-        dna_path: Optional[str] = None,
-        lab_config_path: Optional[str] = None,
-    ) -> None:
-        # Config base (lab_config.yaml)
-        cfg_path = Path(lab_config_path) if lab_config_path else LAB_CONFIG_PATH
-        self.lab_config: Dict[str, Any] = _load_yaml(cfg_path)
+    universo_max: int = 25
+    historico_csv: Optional[Path] = None
 
-        # Pedaços relevantes do config
-        self.motor_cfg: Dict[str, Any] = self.lab_config.get("motor_fgi", {}) or {}
-        self.busca_cfg: Dict[str, Any] = self.motor_cfg.get("busca", {}) or {}
+    # interno
+    _sorteadas_por_k: Dict[int, Set[Tuple[int, ...]]] = None  # type: ignore
 
-        # Engine do PONTO C (se não vier, cria com lab_config carregado)
-        self.ponto_c: PontoCEngine = ponto_c or PontoCEngine(self.lab_config)
+    def __post_init__(self) -> None:
+        self._sorteadas_por_k = {}
+        if self.historico_csv is not None:
+            self._carregar_historico(Path(self.historico_csv))
 
-        # Grupo de Milhões (se não vier, cria)
-        # Importante: GrupoDeMilhoes pode ter assinatura (auto_generate=True/False)
-        # Mantemos o padrão já usado no teu código.
-        self.grupo: GrupoDeMilhoes = grupo or GrupoDeMilhoes(auto_generate=True)
+    @property
+    def universo(self) -> Tuple[int, ...]:
+        return tuple(range(1, int(self.universo_max) + 1))
 
-        # Parâmetros padrão
-        self.regime_padrao: str = (
-            regime_id_padrao
-            or self.motor_cfg.get("usar_regime_padrao")
-            or "R2"
-        )
-        self.qtd_prototipos_padrao: int = int(self.motor_cfg.get("qtd_prototipos_padrao", 50))
-        self.max_candidatos_padrao: int = int(self.busca_cfg.get("max_candidatos_avaliados", 50000))
+    # ---------------------------
+    # Histórico
+    # ---------------------------
 
-        # DNA (opcional): por padrão tenta dna_last25.yaml na raiz
-        resolved_dna_path = Path(dna_path) if dna_path else DNA_LAST25_PATH
-        self.dna: Dict[str, Any] = _load_yaml_optional(resolved_dna_path)
+    def _carregar_historico(self, path: Path) -> None:
+        if not path.exists():
+            raise FileNotFoundError(f"CSV não encontrado: {path}")
 
-        # Guarda metadado útil
-        self.dna_info: Dict[str, Any] = self.dna.get("dna", {}) if isinstance(self.dna.get("dna", {}), dict) else {}
+        with path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
+            try:
+                header = next(reader)
+            except StopIteration:
+                return
 
-    # ----------------------------------------------------------
-    # Helpers de calibração: por enquanto DNA é CONTEXTO
-    # ----------------------------------------------------------
-    def get_dna_contexto(self) -> Dict[str, Any]:
+            header_lower = [(h or "").strip().lower() for h in header]
+
+            # tenta detectar colunas de dezenas (dez1..dez15 etc) por prefixo
+            dez_idxs: List[int] = []
+            for i, h in enumerate(header_lower):
+                if h.startswith("dez") or h.startswith("d") or h.startswith("n"):
+                    dez_idxs.append(i)
+
+            # fallback: se não achou nada, tenta pegar últimas 15 colunas
+            fallback_last_n = 15
+
+            for row in reader:
+                if not row:
+                    continue
+
+                if dez_idxs:
+                    dezenas_raw = [row[i] for i in dez_idxs if i < len(row)]
+                else:
+                    dezenas_raw = row[-fallback_last_n:] if len(row) >= fallback_last_n else row
+
+                dezenas = _as_int_list(dezenas_raw)
+                seq = _norm_seq(dezenas)
+
+                # ignora linha inválida
+                if len(seq) < 1:
+                    continue
+
+                k = len(seq)
+                self._sorteadas_por_k.setdefault(k, set()).add(seq)
+
+    def total_sorteadas(self, k: int) -> int:
+        return len(self._sorteadas_por_k.get(int(k), set()))
+
+    # ---------------------------
+    # Geração / Consulta
+    # ---------------------------
+
+    def ja_sorteada(self, seq: Sequence[int]) -> bool:
+        t = _norm_seq(seq)
+        k = len(t)
+        return t in self._sorteadas_por_k.get(k, set())
+
+    def gerar_combinacoes(self, k: int) -> Iterable[Tuple[int, ...]]:
+        k = int(k)
+        if k < 1 or k > int(self.universo_max):
+            raise ValueError(f"k inválido: {k} (esperado 1..{self.universo_max})")
+        return itertools.combinations(self.universo, k)
+
+    def get_candidatos(self, k: int, limite: int) -> List[Tuple[int, ...]]:
         """
-        Retorna o 'DNA' como contexto de calibração.
-        Não aplica filtro duro ainda (fase de engenharia).
+        Retorna até `limite` combinações de tamanho `k` que ainda não aconteceram.
+
+        - k = tamanho da combinação (ex: 15)
+        - limite = quantidade máxima de candidatos (ex: 2000)
         """
-        if not self.dna_info:
-            return {
-                "ativo": False,
-                "motivo": "dna_last25.yaml ausente ou vazio",
-            }
+        k = int(k)
+        limite = int(limite)
 
-        janelas = self.dna_info.get("janelas", [])
-        metricas = self.dna_info.get("metricas_ativas", [])
-        avaliacao = self.dna_info.get("avaliacao", {})
-        uso_no_motor = self.dna_info.get("uso_no_motor", {})
+        if limite <= 0:
+            return []
 
-        return {
-            "ativo": True,
-            "origem": self.dna_info.get("origem"),
-            "descricao": self.dna_info.get("descricao"),
-            "janelas": janelas,
-            "metricas_ativas": metricas,
-            "avaliacao": avaliacao,
-            "uso_no_motor": uso_no_motor,
-        }
+        sorteadas = self._sorteadas_por_k.get(k, set())
 
-    # ----------------------------------------------------------
-    # API principal: gerar protótipos
-    # ----------------------------------------------------------
-    def gerar_prototipos(
-        self,
-        k: int,
-        regime_id: Optional[str] = None,
-        max_candidatos: Optional[int] = None,
-    ) -> List[Prototipo]:
-        """
-        Gera K protótipos (LHEs) avaliando candidatos do Grupo de Milhões
-        e ranqueando pelo score do PONTO C.
+        candidatos: List[Tuple[int, ...]] = []
+        for comb in self.gerar_combinacoes(k):
+            if comb in sorteadas:
+                continue
+            candidatos.append(comb)
+            if len(candidatos) >= limite:
+                break
 
-        Observação:
-          - Nesta fase, DNA ainda não muda constraints.
-          - DNA entra como contexto e vai servir de calibração depois.
-        """
-        regime = regime_id or self.regime_padrao
-        limite = int(max_candidatos if max_candidatos is not None else self.max_candidatos_padrao)
-
-        candidatos = self.grupo.get_candidatos(limite)  # esperado: List[List[int]] ou iterável
-        prototipos: List[Prototipo] = []
-
-        for seq in candidatos:
-            score: ScoreDetalhado = self.ponto_c.score_sequence(seq, regime)
-            prototipos.append(
-                Prototipo(
-                    sequencia=list(seq),
-                    score_total=float(score.score_total),
-                    coerencias=int(score.coerencias),
-                    violacoes=int(score.violacoes),
-                    detalhes=dict(score.detalhes),
-                )
-            )
-
-        # Ordena: score_total desc, depois menos violações, depois mais coerências
-        prototipos.sort(key=lambda p: (p.score_total, -p.violacoes, p.coerencias), reverse=True)
-
-        # Retorna topo K
-        return prototipos[: int(k)]
-
-    def gerar_prototipos_json(
-        self,
-        k: int,
-        regime_id: Optional[str] = None,
-        max_candidatos: Optional[int] = None,
-        incluir_contexto_dna: bool = True,
-    ) -> Dict[str, Any]:
-        """
-        Versão JSON-friendly para o endpoint /prototipos.
-
-        Mantém compatibilidade com o que você já está usando,
-        mas permite incluir "contexto_dna" no retorno.
-        """
-        protos = self.gerar_prototipos(k=k, regime_id=regime_id, max_candidatos=max_candidatos)
-
-        payload_protos = [
-            {
-                "sequencia": p.sequencia,
-                "score_total": p.score_total,
-                "coerencias": p.coerencias,
-                "violacoes": p.violacoes,
-                "detalhes": p.detalhes,
-            }
-            for p in protos
-        ]
-
-        if not incluir_contexto_dna:
-            return {"prototipos": payload_protos}
-
-        return {
-            "prototipos": payload_protos,
-            "contexto_dna": self.get_dna_contexto(),
-            "regime_usado": regime_id or self.regime_padrao,
-            "max_candidatos_usado": int(max_candidatos if max_candidatos is not None else self.max_candidatos_padrao),
-        }
-
-
-# ==========================================================
-# Teste rápido local
-# ==========================================================
-if __name__ == "__main__":
-    motor = MotorFGI()
-    out = motor.gerar_prototipos_json(k=5, regime_id="R2", max_candidatos=2000)
-    print(out)
+        return candidatos
+```0
