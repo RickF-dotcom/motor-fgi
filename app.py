@@ -1,96 +1,126 @@
-  # Distribuição 1–13 vs 14–25
-        # ----------------------------------------------------
-        c_1_13 = sum(1 for x in seq if 1 <= x <= 13)
-        c_14_25 = len(seq) - c_1_13
+from __future__ import annotations
 
-        ok_1_13 = constraints.min_1_13 <= c_1_13 <= constraints.max_1_13
-        ok_14_25 = constraints.min_14_25 <= c_14_25 <= constraints.max_14_25
+import os
+from typing import Optional
 
-        detalhes["faixa_1_13_14_25"] = {
-            "contagem_1_13": c_1_13,
-            "contagem_14_25": c_14_25,
-            "min_1_13": constraints.min_1_13,
-            "max_1_13": constraints.max_1_13,
-            "min_14_25": constraints.min_14_25,
-            "max_14_25": constraints.max_14_25,
-            "coerente_1_13": ok_1_13,
-            "coerente_14_25": ok_14_25,
-        }
+import yaml
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
-        coerencias += int(ok_1_13) + int(ok_14_25)
-        violacoes += int(not ok_1_13) + int(not ok_14_25)
+from fgi_engine import MotorFGI
+from ponto_c_engine import PontoCEngine
 
-        # ----------------------------------------------------
-        # Números bloqueados
-        # ----------------------------------------------------
-        bloqueados_presentes = [x for x in seq if x in constraints.numeros_bloqueados]
-        detalhes["numeros_bloqueados"] = {
-            "bloqueados": list(constraints.numeros_bloqueados),
-            "presentes_na_seq": bloqueados_presentes,
-        }
-        if bloqueados_presentes:
-            violacoes += len(bloqueados_presentes)
-        else:
-            # se não há bloqueados na sequência, conta como 1 coerência
-            coerencias += 1
 
-        # ----------------------------------------------------
-        # Pares proibidos
-        # ----------------------------------------------------
-        pares = {
-            (min(a, b), max(a, b))
-            for i, a in enumerate(seq)
-            for b in seq[i + 1 :]
-        }
-        pares_proibidos_usados = [
-            p for p in pares if p in constraints.pares_proibidos
-        ]
-        detalhes["pares_proibidos"] = {
-            "proibidos": [list(p) for p in constraints.pares_proibidos],
-            "presentes_na_seq": [list(p) for p in pares_proibidos_usados],
-        }
-        if pares_proibidos_usados:
-            violacoes += len(pares_proibidos_usados)
-        else:
-            coerencias += 1
+# ============================================================
+#  LOAD DO ARQUIVO lab_config.yaml
+# ============================================================
 
-        # ----------------------------------------------------
-        # Trios proibidos (ainda vazio, mas estrutura pronta)
-        # ----------------------------------------------------
-        trios = {
-            tuple(sorted((a, b, c)))
-            for i, a in enumerate(seq)
-            for j, b in enumerate(seq[i + 1 :], start=i + 1)
-            for c in seq[j + 1 :]
-        }
-        trios_proibidos_usados = [
-            t for t in trios if t in constraints.trios_proibidos
-        ]
-        detalhes["trios_proibidos"] = {
-            "proibidos": [list(t) for t in constraints.trios_proibidos],
-            "presentes_na_seq": [list(t) for t in trios_proibidos_usados],
-        }
-        if trios_proibidos_usados:
-            violacoes += len(trios_proibidos_usados)
-        else:
-            coerencias += 1
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LAB_CONFIG_PATH = os.path.join(BASE_DIR, "lab_config.yaml")
 
-        # ----------------------------------------------------
-        # Score total simples
-        # ----------------------------------------------------
-        score_total = float(coerencias - violacoes)
+if not os.path.exists(LAB_CONFIG_PATH):
+    raise FileNotFoundError(
+        f"Arquivo de configuração não encontrado: {LAB_CONFIG_PATH}"
+    )
 
-        return ScoreDetalhado(
-            score_total=score_total,
-            coerencias=coerencias,
-            violacoes=violacoes,
-            detalhes=detalhes,
+with open(LAB_CONFIG_PATH, "r", encoding="utf-8") as f:
+    LAB_CONFIG = yaml.safe_load(f)
+
+
+# ============================================================
+#  INSTÂNCIAS GLOBAIS: PontoCEngine + MotorFGI
+# ============================================================
+
+ponto_c_engine = PontoCEngine(LAB_CONFIG)
+motor_fgi = MotorFGI(ponto_c=ponto_c_engine)
+
+
+# ============================================================
+#  FASTAPI APP
+# ============================================================
+
+app = FastAPI(
+    title="ATHENAH LABORATORIO PMFC",
+    description=(
+        "Backend do MotorFGI + PONTO C + Config YAML. "
+        "Laboratório de engenharia de padrões em janelas 25−."
+    ),
+    version=str(LAB_CONFIG.get("versao_laboratorio", "0.1.0")),
+)
+
+
+# ============================================================
+#  MODELOS Pydantic
+# ============================================================
+
+class PrototipoRequest(BaseModel):
+    k: Optional[int] = None
+    regime_id: Optional[str] = None
+    max_candidatos: Optional[int] = None
+
+
+# ============================================================
+#  ENDPOINTS BÁSICOS
+# ============================================================
+
+@app.get("/lab/config")
+def get_lab_config():
+    """
+    Retorna o conteúdo completo do arquivo lab_config.yaml como JSON.
+    """
+    return JSONResponse(content=LAB_CONFIG)
+
+
+@app.get("/lab/status")
+def status():
+    """
+    Status simples do laboratório.
+    """
+    return {
+        "status": "online",
+        "versao_laboratorio": LAB_CONFIG.get("versao_laboratorio", "desconhecida"),
+    }
+
+
+# ============================================================
+#  ENDPOINT: GERAR PROTÓTIPOS (FGI ESTRUTURAL)
+# ============================================================
+
+@app.post("/prototipos")
+def gerar_prototipos(req: PrototipoRequest):
+    """
+    Gera protótipos estruturais (FGIs) usando:
+
+      - MotorFGI (decoder)
+      - PontoCEngine (constraints + score)
+      - Grupo de Milhões (combinações não sorteadas)
+
+    Corpo da requisição (JSON):
+
+      {
+        "k": 20,                # opcional, quantidade de protótipos
+        "regime_id": "R2",      # opcional, regime (default vem do lab_config)
+        "max_candidatos": 5000  # opcional, limite de candidatos avaliados
+      }
+
+    Retorno: lista de objetos com:
+      - sequencia
+      - score_total
+      - coerencias
+      - violacoes
+      - detalhes (por tipo de verificação)
+    """
+    try:
+        prototipos = motor_fgi.gerar_prototipos_json(
+            k=req.k,
+            regime_id=req.regime_id,
+            max_candidatos=req.max_candidatos,
         )
-
-
-# Pequeno teste manual (não será executado no Render, mas ajuda localmente)
-if __name__ == "__main__":
-    engine = PontoCEngine()
-    exemplo_seq = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 22, 23, 24, 25]
-    resultado = engine.score_sequence(exemplo_seq, regime_id="R2")
-    print("Score exemplo:", resultado)
+        return prototipos
+    except ValueError as e:
+        # Erros de domínio (grupo de milhões vazio, etc.)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        # Erros inesperados
+        raise HTTPException(status_code=500, detail=f"Erro interno: {e}")
