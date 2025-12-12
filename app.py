@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from typing import Optional
 
 import yaml
 from fastapi import FastAPI, HTTPException
@@ -98,17 +99,10 @@ def gerar_prototipos(req: PrototipoRequest):
     Corpo da requisição (JSON):
 
       {
-        "k": 20,                # opcional, quantidade de protótipos
-        "regime_id": "R2",      # opcional, regime (default vem do lab_config)
-        "max_candidatos": 5000  # opcional, limite de candidatos avaliados
+        "k": 20,
+        "regime_id": "R2",
+        "max_candidatos": 5000
       }
-
-    Retorno: lista de objetos com:
-      - sequencia
-      - score_total
-      - coerencias
-      - violacoes
-      - detalhes (por tipo de verificação)
     """
     try:
         prototipos = motor_fgi.gerar_prototipos_json(
@@ -118,8 +112,6 @@ def gerar_prototipos(req: PrototipoRequest):
         )
         return prototipos
     except ValueError as e:
-        # Erros de domínio (grupo de milhões vazio, etc.)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        # Erros inesperados
         raise HTTPException(status_code=500, detail=f"Erro interno: {e}")
