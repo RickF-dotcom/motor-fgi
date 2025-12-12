@@ -1,0 +1,35 @@
+dna:
+  origem: "ultimos_25_concursos"
+  descricao: "DNA estrutural extraído das últimas 25 sequências reais"
+  janelas:
+    - tamanho: 7
+      uso: "hiper-micro"
+    - tamanho: 10
+      uso: "micro"
+    - tamanho: 12
+      uso: "transicao"
+    - tamanho: 15
+      uso: "micro-expandido"
+    - tamanho: 20
+      uso: "meso"
+    - tamanho: 25
+      uso: "regime_atual"
+
+metricas_ativas:
+  - soma
+  - pares_impares
+  - distribuicao_faixas
+  - repeticao
+  - ausentes
+  - sequencia_contigua
+
+avaliacao:
+  coerencia_minima: 0.70
+  coerencia_alta: 0.85
+  coerencia_top: 0.97
+
+uso_no_motor:
+  papel: "calibracao"
+  influencia_score: true
+  influencia_filtros: true
+  permite_adaptacao: true
