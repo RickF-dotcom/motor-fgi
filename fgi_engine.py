@@ -1,274 +1,188 @@
-# fgi_engine.py
-#
-# Motor de FGIs com:
-# - estatísticas finas dos últimos concursos
-# - integração com o "grupo de milhões" (combinações não sorteadas)
-#
-# Este arquivo foi pensado para funcionar junto com:
-#   - grupo_de_milhoes.py
-#   - app.py (API FastAPI)
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Dict, Iterable, Tuple
-import statistics
-import random
+from typing import List, Dict, Any, Optional
 
 from grupo_de_milhoes import GrupoDeMilhoes
+from ponto_c_engine import PontoCEngine, ScoreDetalhado
 
 
-# -------------------------------------------------------------------
-# Estruturas de dados
-# -------------------------------------------------------------------
-
+# ============================================================
+#  Estrutura de saída: Prototipo
+# ============================================================
 
 @dataclass
-class AnaliseEstado:
-    total_concursos: int
-    freq: Dict[int, int]
-    frias: List[int]
-    quentes: List[int]
+class Prototipo:
+    sequencia: List[int]
+    score_total: float
+    coerencias: int
+    violacoes: int
+    detalhes: Dict[str, Any]
 
 
-# -------------------------------------------------------------------
-# FGIMotor
-# -------------------------------------------------------------------
+# ============================================================
+#  MotorFGI (NOVA VERSÃO) – Decoder do PONTO C
+# ============================================================
 
-
-class FGIMotor:
+class MotorFGI:
     """
-    Motor responsável por:
-      - receber concursos reais
-      - calcular estatísticas finas (freq, frias, quentes)
-      - conversar com o GrupoDeMilhoes para remover sorteadas
-      - gerar FGIs filtradas/ranqueadas
+    MotorFGI v0.1
+
+    Papel desta versão:
+
+      - NÃO pensa em estatística própria.
+      - NÃO define regra de FGI.
+
+    Quem pensa:
+      - PontoCEngine (grafo C + constraints).
+
+    Função do MotorFGI:
+      - consumir o GrupoDeMilhoes (combinações não sorteadas),
+      - usar o PontoCEngine para:
+          * obter constraints por regime,
+          * calcular score de coerência de sequência,
+      - devolver PROTÓTIPOS estruturais (FGIs) ordenados por score.
     """
 
-    def __init__(self) -> None:
-        # estatística dos últimos concursos carregados
-        self.total_concursos: int = 0
-        self.freq: Dict[int, int] = {d: 0 for d in range(1, 26)}
-        self.frias: List[int] = []
-        self.quentes: List[int] = []
-
-        # janela de concursos em memória (na ordem em que chegam)
-        self.concursos: List[List[int]] = []
-
-        # grupo de milhões (universo de combinações NÃO sorteadas)
-        # auto_generate=True → se não existir .pkl ele gera
-        self.grupo: GrupoDeMilhoes = GrupoDeMilhoes(auto_generate=True)
-
-    # ------------------------------------------------------------------
-    # Normalização / validação de concursos
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _normaliza_jogo(jogo: Iterable[int]) -> List[int]:
-        """
-        Garante:
-          - inteiros
-          - entre 1 e 25
-          - sem repetição
-          - ordenado
-        """
-        try:
-            dezenas = [int(d) for d in jogo]
-        except Exception:
-            raise ValueError(f"Jogo inválido (não numérico): {jogo}")
-
-        if len(dezenas) != 15:
-            raise ValueError(f"Jogo deve ter 15 dezenas, recebeu {len(dezenas)}: {jogo}")
-
-        if any(d < 1 or d > 25 for d in dezenas):
-            raise ValueError(f"Dezenas devem estar entre 1 e 25: {jogo}")
-
-        if len(set(dezenas)) != 15:
-            raise ValueError(f"Jogo possui dezenas repetidas: {jogo}")
-
-        return sorted(dezenas)
-
-    # ------------------------------------------------------------------
-    # Carregamento de concursos + estatísticas finas
-    # ------------------------------------------------------------------
-
-    def carregar(self, concursos: List[List[int]]) -> AnaliseEstado:
-        """
-        Recebe uma janela de concursos e atualiza:
-          - total_concursos
-          - freq
-          - frias / quentes
-          - lista self.concursos
-        Também remove esses concursos do grupo de milhões.
-        """
-        if not concursos:
-            raise ValueError("Lista de concursos vazia.")
-
-        concursos_norm: List[List[int]] = []
-
-        # acumula freq e normaliza concursos
-        for jogo in concursos:
-            jogo_norm = self._normaliza_jogo(jogo)
-            concursos_norm.append(jogo_norm)
-
-            self.concursos.append(jogo_norm)
-            self.total_concursos += 1
-
-            for d in jogo_norm:
-                self.freq[d] += 1
-
-        # define frias/quentes via quantis da distribuição de frequências
-        if self.total_concursos > 0:
-            valores = list(self.freq.values())
-            # quantis 25% e 75%
-            q1 = statistics.quantiles(valores, n=4)[0]
-            q3 = statistics.quantiles(valores, n=4)[2]
-
-            self.frias = [d for d, f in self.freq.items() if f <= q1]
-            self.quentes = [d for d, f in self.freq.items() if f >= q3]
-        else:
-            self.frias = []
-            self.quentes = []
-
-        # integra com o grupo de milhões (remove sorteadas do universo)
-        try:
-            self.grupo.remover_sorteadas(concursos_norm)
-        except Exception:
-            # se der problema de I/O ou outro erro, não derruba o motor
-            pass
-
-        return AnaliseEstado(
-            total_concursos=self.total_concursos,
-            freq=self.freq.copy(),
-            frias=list(self.frias),
-            quentes=list(self.quentes),
-        )
-
-    # wrapper para a API (o app.py usa ESTE nome)
-    def carregar_concursos(self, concursos: List[List[int]]) -> AnaliseEstado:
-        """
-        Interface usada pela API. Mantém o nome explícito para clareza.
-        """
-        return self.carregar(concursos)
-
-    # ------------------------------------------------------------------
-    # Exposição simples de resumo (se quiser usar em outros pontos)
-    # ------------------------------------------------------------------
-
-    def resumo_basico(self) -> Dict[str, object]:
-        """
-        Dict pronto para serializar em JSON.
-        """
-        return {
-            "total_concursos": self.total_concursos,
-            "freq": {str(d): f for d, f in self.freq.items()},
-            "frias": self.frias,
-            "quentes": self.quentes,
-        }
-
-    # ------------------------------------------------------------------
-    # Scoring e filtros para geração de FGIs
-    # ------------------------------------------------------------------
-
-    def _conta_frias_quentes(self, jogo: List[int]) -> Tuple[int, int]:
-        set_frias = set(self.frias)
-        set_quentes = set(self.quentes)
-
-        c_f = sum(1 for d in jogo if d in set_frias)
-        c_q = sum(1 for d in jogo if d in set_quentes)
-
-        return c_f, c_q
-
-    @staticmethod
-    def _conta_consecutivos(jogo: List[int]) -> int:
-        """
-        Maior sequência de dezenas consecutivas dentro do jogo.
-        """
-        if not jogo:
-            return 0
-
-        ordenado = sorted(jogo)
-        max_run = 1
-        run = 1
-
-        for i in range(1, len(ordenado)):
-            if ordenado[i] == ordenado[i - 1] + 1:
-                run += 1
-                if run > max_run:
-                    max_run = run
-            else:
-                run = 1
-
-        return max_run
-
-    def _score_jogo(self, jogo: List[int]) -> float:
-        """
-        Score simples combinando:
-          - quantidade de frias/quentes
-          - controle leve de consecutivos
-        Quanto maior o score, mais "interessante" para estudo.
-        """
-        c_f, c_q = self._conta_frias_quentes(jogo)
-        consec = self._conta_consecutivos(jogo)
-
-        # pesos simples – você pode calibrar depois
-        score = (
-            c_f * 1.2 +
-            c_q * 1.0 -
-            max(0, consec - 4) * 0.5
-        )
-        return score
-
-    # ------------------------------------------------------------------
-    # Geração de FGIs refinadas
-    # ------------------------------------------------------------------
-
-    def gerar_fino(
+    def __init__(
         self,
-        n: int = 32,
-        min_frias: int = 5,
-        min_quentes: int = 4,
-    ) -> List[List[int]]:
-        """
-        Gera N jogos usando:
-          - universo do GrupoDeMilhoes (não sorteados)
-          - filtros de min_frias / min_quentes
-          - score para ordenar
+        ponto_c: Optional[PontoCEngine] = None,
+        grupo: Optional[GrupoDeMilhoes] = None,
+        regime_id_padrao: Optional[str] = None,
+    ) -> None:
+        # Engine do PONTO C (se não vier de fora, cria um novo)
+        self.ponto_c: PontoCEngine = ponto_c or PontoCEngine()
 
-        Se o grupo de milhões estiver vazio, levanta erro.
+        # Config geral vinda do lab_config.yaml via PontoCEngine
+        self.lab_config: Dict[str, Any] = self.ponto_c.config
+        self.motor_cfg: Dict[str, Any] = self.lab_config.get("motor_fgi", {})
+        self.busca_cfg: Dict[str, Any] = self.motor_cfg.get("busca", {})
+
+        # Grupo de milhões (universo de combinações não sorteadas)
+        # auto_generate=True → se não existir .pkl ele gera
+        self.grupo: GrupoDeMilhoes = grupo or GrupoDeMilhoes(auto_generate=True)
+
+        # Parâmetros padrão
+        self.tamanho_jogo_padrao: int = int(
+            self.motor_cfg.get("tamanho_jogo_padrao", 15)
+        )
+        self.qtd_prototipos_padrao: int = int(
+            self.motor_cfg.get("qtd_prototipos_padrao", 50)
+        )
+        self.max_candidatos_avaliados_padrao: int = int(
+            self.busca_cfg.get("max_candidatos_avaliados", 50000)
+        )
+        self.regime_padrao: str = (
+            regime_id_padrao
+            or self.motor_cfg.get("usar_regime_padrao", "R2")
+        )
+
+    # --------------------------------------------------------
+    #  API principal: gerar protótipos estruturais
+    # --------------------------------------------------------
+    def gerar_prototipos(
+        self,
+        k: Optional[int] = None,
+        regime_id: Optional[str] = None,
+        max_candidatos: Optional[int] = None,
+    ) -> List[Prototipo]:
         """
+        Gera até k protótipos estruturais (FGIs) usando:
+
+          - universo do GrupoDeMilhoes (combinações não sorteadas),
+          - constraints do PontoCEngine para o regime escolhido,
+          - score de coerência do PontoCEngine.
+
+        Retorna uma lista de Prototipo, ordenada por score_total (desc).
+        """
+
         if not self.grupo.combos:
             raise ValueError(
                 "Grupo de milhões está vazio. "
-                "Garanta que o arquivo .pkl foi gerado."
+                "Garanta que o arquivo grupo_de_milhoes.pkl foi gerado."
             )
 
-        escolhidos: List[Tuple[float, List[int]]] = []
-        tentativas = 0
-        limite_tentativas = max(500, n * 50)
+        # Parâmetros efetivos
+        k = int(k or self.qtd_prototipos_padrao)
+        regime_id = regime_id or self.regime_padrao
 
-        while len(escolhidos) < n and tentativas < limite_tentativas:
-            tentativas += 1
+        # número máximo de candidatos para amostragem
+        max_cand_cfg = self.max_candidatos_avaliados_padrao
+        n_candidatos = int(max_candidatos or max_cand_cfg)
+        n_candidatos = max(1, min(n_candidatos, len(self.grupo.combos)))
 
-            # pega 1 jogo aleatório do grupo de milhões
-            jogo = self.grupo.sample(1)[0]
+        # Amostra candidatos do grupo de milhões
+        candidatos: List[List[int]] = self.grupo.sample(n_candidatos)
 
-            c_f, c_q = self._conta_frias_quentes(jogo)
+        avaliados: List[Prototipo] = []
 
-            if c_f < min_frias or c_q < min_quentes:
+        for seq in candidatos:
+            # Garante tamanho de jogo esperado
+            if len(seq) != self.tamanho_jogo_padrao:
                 continue
 
-            score = self._score_jogo(jogo)
-            escolhidos.append((score, jogo))
+            score: ScoreDetalhado = self.ponto_c.score_sequence(seq, regime_id)
+            prot = Prototipo(
+                sequencia=seq,
+                score_total=score.score_total,
+                coerencias=score.coerencias,
+                violacoes=score.violacoes,
+                detalhes=score.detalhes,
+            )
+            avaliados.append(prot)
 
-        if not escolhidos:
+        if not avaliados:
             raise ValueError(
-                "Não foi possível gerar jogos que respeitem os filtros "
-                f"(min_frias={min_frias}, min_quentes={min_quentes})."
+                "Nenhum candidato pôde ser avaliado. "
+                "Verifique grupo de milhões e configurações do laboratório."
             )
 
-        # ordena por score (desc) e devolve só os jogos
-        escolhidos.sort(key=lambda x: x[0], reverse=True)
-        jogos_ordenados = [j for _, j in escolhidos[:n]]
+        # Ordena por score_total (decrescente) e pega top-k
+        avaliados.sort(key=lambda p: p.score_total, reverse=True)
+        return avaliados[:k]
 
-        return jogos_ordenados
+    # --------------------------------------------------------
+    #  Versão amigável para API (JSON-ready)
+    # --------------------------------------------------------
+    def gerar_prototipos_json(
+        self,
+        k: Optional[int] = None,
+        regime_id: Optional[str] = None,
+        max_candidatos: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Wrapper que transforma Prototipo em dict pronto para JSON.
+        Ideal para uso direto no FastAPI.
+        """
+        prototipos = self.gerar_prototipos(
+            k=k,
+            regime_id=regime_id,
+            max_candidatos=max_candidatos,
+        )
+        retorno: List[Dict[str, Any]] = []
+
+        for p in prototipos:
+            retorno.append(
+                {
+                    "sequencia": p.sequencia,
+                    "score_total": p.score_total,
+                    "coerencias": p.coerencias,
+                    "violacoes": p.violacoes,
+                    "detalhes": p.detalhes,
+                }
+            )
+
+        return retorno
+
+
+# ------------------------------------------------------------
+# Teste rápido local (não afeta o Render)
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    motor = MotorFGI()
+    protos = motor.gerar_prototipos(k=5, regime_id="R2")
+    for i, p in enumerate(protos, start=1):
+        print(f"# Protótipo {i}")
+        print("Sequência:", p.sequencia)
+        print("Score:", p.score_total, "Coerências:", p.coerencias, "Violações:", p.violacoes)
+        print("-" * 40)
