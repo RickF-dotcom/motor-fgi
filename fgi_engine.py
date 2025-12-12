@@ -1,147 +1,173 @@
-# grupo_de_milhoes.py
+# fgi_engine.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
-import csv
-import itertools
+from typing import Any, Dict, List, Optional
+
+import json
+
+from grupo_de_milhoes import GrupoDeMilhoes
+
+try:
+    import yaml  # type: ignore
+except Exception:
+    yaml = None
 
 
-def _as_int_list(values: Iterable[str]) -> List[int]:
-    out: List[int] = []
-    for v in values:
-        v = (v or "").strip()
-        if not v:
-            continue
+BASE_DIR = Path(__file__).resolve().parent
+LAB_CONFIG_PATH = BASE_DIR / "lab_config.yaml"
+DNA_LAST25_PATH = BASE_DIR / "dna_last25.json"
+
+
+def _load_yaml(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    if yaml is None:
+        return {}
+    with path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+        return data if isinstance(data, dict) else {}
+
+
+def _load_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as f:
         try:
-            out.append(int(v))
+            data = json.load(f)
         except Exception:
-            # ignora lixo
-            continue
-    return out
-
-
-def _norm_seq(seq: Sequence[int]) -> Tuple[int, ...]:
-    # normaliza como tupla ordenada crescente, sem duplicatas
-    return tuple(sorted({int(x) for x in seq if x is not None}))
+            return {}
+        return data if isinstance(data, dict) else {}
 
 
 @dataclass
-class GrupoDeMilhoes:
+class Score:
+    score_total: float
+    coerencias: int = 0
+    violacoes: int = 0
+    detalhes: Dict[str, Any] = None  # type: ignore
+
+
+@dataclass
+class Prototipo:
+    sequencia: List[int]
+    score_total: float
+    coerencias: int
+    violacoes: int
+    detalhes: Dict[str, Any]
+
+
+class MotorFGI:
     """
-    Grupo de Milhões = universo de combinações que ainda NÃO aconteceram.
-
-    - Universo padrão: 1..25 (Lotofácil)
-    - Lê um CSV histórico (opcional) e registra as sequências já sorteadas
-    - Gera combinações (itertools.combinations) e filtra as já sorteadas
-    - Entrega candidatos via get_candidatos(k, limite)
-
-    Observação importante:
-    - O histórico exclui sequências do MESMO tamanho k.
-      Ex.: se seu CSV tem concursos de 15 dezenas, ele exclui apenas k=15.
+    MotorFGI (base) para o laboratório:
+    - Puxa candidatos do GrupoDeMilhoes
+    - Calcula score (placeholder aqui; você troca pelo PONTO C real)
+    - Ordena e retorna protótipos
     """
 
-    universo_max: int = 25
-    historico_csv: Optional[Path] = None
+    def __init__(
+        self,
+        historico_csv: Optional[str] = None,
+        universo_max: int = 25,
+        auto_generate: bool = False,
+        lab_config_path: Optional[str] = None,
+        dna_last25_path: Optional[str] = None,
+    ) -> None:
+        self.lab_config_path = Path(lab_config_path) if lab_config_path else LAB_CONFIG_PATH
+        self.dna_last25_path = Path(dna_last25_path) if dna_last25_path else DNA_LAST25_PATH
 
-    # interno
-    _sorteadas_por_k: Dict[int, Set[Tuple[int, ...]]] = None  # type: ignore
+        self.lab_config = _load_yaml(self.lab_config_path)
+        self._dna_last25 = _load_json(self.dna_last25_path)
 
-    def __post_init__(self) -> None:
-        self._sorteadas_por_k = {}
-        if self.historico_csv is not None:
-            self._carregar_historico(Path(self.historico_csv))
+        self.grupo = GrupoDeMilhoes(
+            universo_max=int(universo_max),
+            historico_csv=Path(historico_csv) if historico_csv else None,
+            auto_generate=bool(auto_generate),
+        )
 
-    @property
-    def universo(self) -> Tuple[int, ...]:
-        return tuple(range(1, int(self.universo_max) + 1))
+    # ----------------------------
+    # Contexto (DNA)
+    # ----------------------------
+    def get_dna_contexto(self) -> Dict[str, Any]:
+        return dict(self._dna_last25) if isinstance(self._dna_last25, dict) else {}
 
-    # ---------------------------
-    # Histórico
-    # ---------------------------
+    # ----------------------------
+    # Score (placeholder)
+    # ----------------------------
+    def _score_sequence(self, seq: List[int], regime_id: Optional[str]) -> Score:
+        # placeholder mínimo (não quebra o fluxo)
+        coerencias = 0
+        violacoes = 0
+        detalhes: Dict[str, Any] = {"regime_id": regime_id}
 
-    def _carregar_historico(self, path: Path) -> None:
-        if not path.exists():
-            raise FileNotFoundError(f"CSV não encontrado: {path}")
+        if len(seq) != len(set(seq)):
+            violacoes += 1
 
-        with path.open("r", encoding="utf-8", newline="") as f:
-            reader = csv.reader(f)
-            try:
-                header = next(reader)
-            except StopIteration:
-                return
+        if all(1 <= x <= self.grupo.universo_max for x in seq):
+            coerencias += 1
 
-            header_lower = [(h or "").strip().lower() for h in header]
+        score_total = float(coerencias) - float(violacoes) * 10.0
+        return Score(score_total=score_total, coerencias=coerencias, violacoes=violacoes, detalhes=detalhes)
 
-            # tenta detectar colunas de dezenas (dez1..dez15 etc) por prefixo
-            dez_idxs: List[int] = []
-            for i, h in enumerate(header_lower):
-                if h.startswith("dez") or h.startswith("d") or h.startswith("n"):
-                    dez_idxs.append(i)
-
-            # fallback: se não achou nada, tenta pegar últimas 15 colunas
-            fallback_last_n = 15
-
-            for row in reader:
-                if not row:
-                    continue
-
-                if dez_idxs:
-                    dezenas_raw = [row[i] for i in dez_idxs if i < len(row)]
-                else:
-                    dezenas_raw = row[-fallback_last_n:] if len(row) >= fallback_last_n else row
-
-                dezenas = _as_int_list(dezenas_raw)
-                seq = _norm_seq(dezenas)
-
-                # ignora linha inválida
-                if len(seq) < 1:
-                    continue
-
-                k = len(seq)
-                self._sorteadas_por_k.setdefault(k, set()).add(seq)
-
-    def total_sorteadas(self, k: int) -> int:
-        return len(self._sorteadas_por_k.get(int(k), set()))
-
-    # ---------------------------
-    # Geração / Consulta
-    # ---------------------------
-
-    def ja_sorteada(self, seq: Sequence[int]) -> bool:
-        t = _norm_seq(seq)
-        k = len(t)
-        return t in self._sorteadas_por_k.get(k, set())
-
-    def gerar_combinacoes(self, k: int) -> Iterable[Tuple[int, ...]]:
+    # ----------------------------
+    # API principal
+    # ----------------------------
+    def gerar_prototipos(
+        self,
+        k: int,
+        regime_id: Optional[str] = None,
+        max_candidatos: Optional[int] = None,
+    ) -> List[Prototipo]:
         k = int(k)
-        if k < 1 or k > int(self.universo_max):
-            raise ValueError(f"k inválido: {k} (esperado 1..{self.universo_max})")
-        return itertools.combinations(self.universo, k)
+        limite = int(max_candidatos) if max_candidatos is not None else 2000
 
-    def get_candidatos(self, k: int, limite: int) -> List[Tuple[int, ...]]:
-        """
-        Retorna até `limite` combinações de tamanho `k` que ainda não aconteceram.
+        # ✅ CORREÇÃO CRÍTICA:
+        # k é k; limite é limite. Não inverter.
+        candidatos = self.grupo.get_candidatos(k=k, max_candidatos=limite)
 
-        - k = tamanho da combinação (ex: 15)
-        - limite = quantidade máxima de candidatos (ex: 2000)
-        """
-        k = int(k)
-        limite = int(limite)
+        prototipos: List[Prototipo] = []
+        for seq in candidatos:
+            sc = self._score_sequence(seq, regime_id=regime_id)
+            prototipos.append(
+                Prototipo(
+                    sequencia=list(seq),
+                    score_total=float(sc.score_total),
+                    coerencias=int(sc.coerencias),
+                    violacoes=int(sc.violacoes),
+                    detalhes=dict(sc.detalhes) if sc.detalhes else {},
+                )
+            )
 
-        if limite <= 0:
-            return []
+        prototipos.sort(key=lambda p: (-p.score_total, p.violacoes, -p.coerencias))
+        return prototipos[:k]
 
-        sorteadas = self._sorteadas_por_k.get(k, set())
+    def gerar_prototipos_json(
+        self,
+        k: int,
+        regime_id: Optional[str] = None,
+        max_candidatos: Optional[int] = None,
+        incluir_contexto_dna: bool = True,
+    ) -> Dict[str, Any]:
+        protos = self.gerar_prototipos(k=k, regime_id=regime_id, max_candidatos=max_candidatos)
 
-        candidatos: List[Tuple[int, ...]] = []
-        for comb in self.gerar_combinacoes(k):
-            if comb in sorteadas:
-                continue
-            candidatos.append(comb)
-            if len(candidatos) >= limite:
-                break
+        payload_protos = [
+            {
+                "sequencia": p.sequencia,
+                "score_total": p.score_total,
+                "coerencias": p.coerencias,
+                "violacoes": p.violacoes,
+                "detalhes": p.detalhes,
+            }
+            for p in protos
+        ]
 
-        return candidatos
-```0
+        if not incluir_contexto_dna:
+            return {"prototipos": payload_protos}
+
+        return {
+            "prototipos": payload_protos,
+            "contexto_dna": self.get_dna_contexto(),
+            "regime_usado": regime_id,
+            "max_candidatos_usado": int(max_candidatos) if max_candidatos is not None else 2000,
+        }
