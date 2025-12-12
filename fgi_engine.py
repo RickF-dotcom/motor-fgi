@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import os
+import yaml
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from grupo_de_milhoes import GrupoDeMilhoes
 from ponto_c_engine import PontoCEngine, ScoreDetalhado
 
 
-# ============================================================
-#  Estrutura de saída: Prototipo
-# ============================================================
-
+# ==========================================================
+# Estrutura de saída: Protótipo (LHE / FGI estrutural)
+# ==========================================================
 @dataclass
 class Prototipo:
     sequencia: List[int]
@@ -20,28 +22,45 @@ class Prototipo:
     detalhes: Dict[str, Any]
 
 
-# ============================================================
-#  MotorFGI (NOVA VERSÃO) – Decoder do PONTO C
-# ============================================================
+# ==========================================================
+# Util: caminhos e carga de YAML
+# ==========================================================
+BASE_DIR = Path(__file__).resolve().parent
+LAB_CONFIG_PATH = BASE_DIR / "lab_config.yaml"
+DNA_LAST25_PATH = BASE_DIR / "dna_last25.yaml"
 
+
+def _load_yaml(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Arquivo não encontrado: {path}")
+    with path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"YAML inválido (esperado dict no topo): {path}")
+    return data
+
+
+def _load_yaml_optional(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    return data if isinstance(data, dict) else {}
+
+
+# ==========================================================
+# MotorFGI (Decoder do PONTO C + Grupo de Milhões + DNA)
+# ==========================================================
 class MotorFGI:
     """
-    MotorFGI v0.1
+    MotorFGI v0.2 (com DNA opcional)
 
-    Papel desta versão:
-
-      - NÃO pensa em estatística própria.
-      - NÃO define regra de FGI.
-
-    Quem pensa:
-      - PontoCEngine (grafo C + constraints).
-
-    Função do MotorFGI:
-      - consumir o GrupoDeMilhoes (combinações não sorteadas),
-      - usar o PontoCEngine para:
-          * obter constraints por regime,
-          * calcular score de coerência de sequência,
-      - devolver PROTÓTIPOS estruturais (FGIs) ordenados por score.
+    Papel:
+      - Consome o GrupoDeMilhoes (combinações não sorteadas)
+      - Usa PontoCEngine para calcular coerência/violação por regime
+      - Ordena e devolve protótipos estruturais (LHEs)
+      - Injeta DNA (últimos 25) como "contexto de calibração" (não bloqueia nada ainda)
+        -> neste estágio, DNA entra como METADADO e parâmetro de ajuste futuro
     """
 
     def __init__(
@@ -49,140 +68,152 @@ class MotorFGI:
         ponto_c: Optional[PontoCEngine] = None,
         grupo: Optional[GrupoDeMilhoes] = None,
         regime_id_padrao: Optional[str] = None,
+        dna_path: Optional[str] = None,
+        lab_config_path: Optional[str] = None,
     ) -> None:
-        # Engine do PONTO C (se não vier de fora, cria um novo)
-        self.ponto_c: PontoCEngine = ponto_c or PontoCEngine()
+        # Config base (lab_config.yaml)
+        cfg_path = Path(lab_config_path) if lab_config_path else LAB_CONFIG_PATH
+        self.lab_config: Dict[str, Any] = _load_yaml(cfg_path)
 
-        # Config geral vinda do lab_config.yaml via PontoCEngine
-        self.lab_config: Dict[str, Any] = self.ponto_c.config
-        self.motor_cfg: Dict[str, Any] = self.lab_config.get("motor_fgi", {})
-        self.busca_cfg: Dict[str, Any] = self.motor_cfg.get("busca", {})
+        # Pedaços relevantes do config
+        self.motor_cfg: Dict[str, Any] = self.lab_config.get("motor_fgi", {}) or {}
+        self.busca_cfg: Dict[str, Any] = self.motor_cfg.get("busca", {}) or {}
 
-        # Grupo de milhões (universo de combinações não sorteadas)
-        # auto_generate=True → se não existir .pkl ele gera
+        # Engine do PONTO C (se não vier, cria com lab_config carregado)
+        self.ponto_c: PontoCEngine = ponto_c or PontoCEngine(self.lab_config)
+
+        # Grupo de Milhões (se não vier, cria)
+        # Importante: GrupoDeMilhoes pode ter assinatura (auto_generate=True/False)
+        # Mantemos o padrão já usado no teu código.
         self.grupo: GrupoDeMilhoes = grupo or GrupoDeMilhoes(auto_generate=True)
 
         # Parâmetros padrão
-        self.tamanho_jogo_padrao: int = int(
-            self.motor_cfg.get("tamanho_jogo_padrao", 15)
-        )
-        self.qtd_prototipos_padrao: int = int(
-            self.motor_cfg.get("qtd_prototipos_padrao", 50)
-        )
-        self.max_candidatos_avaliados_padrao: int = int(
-            self.busca_cfg.get("max_candidatos_avaliados", 50000)
-        )
         self.regime_padrao: str = (
             regime_id_padrao
-            or self.motor_cfg.get("usar_regime_padrao", "R2")
+            or self.motor_cfg.get("usar_regime_padrao")
+            or "R2"
         )
+        self.qtd_prototipos_padrao: int = int(self.motor_cfg.get("qtd_prototipos_padrao", 50))
+        self.max_candidatos_padrao: int = int(self.busca_cfg.get("max_candidatos_avaliados", 50000))
 
-    # --------------------------------------------------------
-    #  API principal: gerar protótipos estruturais
-    # --------------------------------------------------------
+        # DNA (opcional): por padrão tenta dna_last25.yaml na raiz
+        resolved_dna_path = Path(dna_path) if dna_path else DNA_LAST25_PATH
+        self.dna: Dict[str, Any] = _load_yaml_optional(resolved_dna_path)
+
+        # Guarda metadado útil
+        self.dna_info: Dict[str, Any] = self.dna.get("dna", {}) if isinstance(self.dna.get("dna", {}), dict) else {}
+
+    # ----------------------------------------------------------
+    # Helpers de calibração: por enquanto DNA é CONTEXTO
+    # ----------------------------------------------------------
+    def get_dna_contexto(self) -> Dict[str, Any]:
+        """
+        Retorna o 'DNA' como contexto de calibração.
+        Não aplica filtro duro ainda (fase de engenharia).
+        """
+        if not self.dna_info:
+            return {
+                "ativo": False,
+                "motivo": "dna_last25.yaml ausente ou vazio",
+            }
+
+        janelas = self.dna_info.get("janelas", [])
+        metricas = self.dna_info.get("metricas_ativas", [])
+        avaliacao = self.dna_info.get("avaliacao", {})
+        uso_no_motor = self.dna_info.get("uso_no_motor", {})
+
+        return {
+            "ativo": True,
+            "origem": self.dna_info.get("origem"),
+            "descricao": self.dna_info.get("descricao"),
+            "janelas": janelas,
+            "metricas_ativas": metricas,
+            "avaliacao": avaliacao,
+            "uso_no_motor": uso_no_motor,
+        }
+
+    # ----------------------------------------------------------
+    # API principal: gerar protótipos
+    # ----------------------------------------------------------
     def gerar_prototipos(
         self,
-        k: Optional[int] = None,
+        k: int,
         regime_id: Optional[str] = None,
         max_candidatos: Optional[int] = None,
     ) -> List[Prototipo]:
         """
-        Gera até k protótipos estruturais (FGIs) usando:
+        Gera K protótipos (LHEs) avaliando candidatos do Grupo de Milhões
+        e ranqueando pelo score do PONTO C.
 
-          - universo do GrupoDeMilhoes (combinações não sorteadas),
-          - constraints do PontoCEngine para o regime escolhido,
-          - score de coerência do PontoCEngine.
-
-        Retorna uma lista de Prototipo, ordenada por score_total (desc).
+        Observação:
+          - Nesta fase, DNA ainda não muda constraints.
+          - DNA entra como contexto e vai servir de calibração depois.
         """
+        regime = regime_id or self.regime_padrao
+        limite = int(max_candidatos if max_candidatos is not None else self.max_candidatos_padrao)
 
-        if not self.grupo.combos:
-            raise ValueError(
-                "Grupo de milhões está vazio. "
-                "Garanta que o arquivo grupo_de_milhoes.pkl foi gerado."
-            )
-
-        # Parâmetros efetivos
-        k = int(k or self.qtd_prototipos_padrao)
-        regime_id = regime_id or self.regime_padrao
-
-        # número máximo de candidatos para amostragem
-        max_cand_cfg = self.max_candidatos_avaliados_padrao
-        n_candidatos = int(max_candidatos or max_cand_cfg)
-        n_candidatos = max(1, min(n_candidatos, len(self.grupo.combos)))
-
-        # Amostra candidatos do grupo de milhões
-        candidatos: List[List[int]] = self.grupo.sample(n_candidatos)
-
-        avaliados: List[Prototipo] = []
+        candidatos = self.grupo.get_candidatos(limite)  # esperado: List[List[int]] ou iterável
+        prototipos: List[Prototipo] = []
 
         for seq in candidatos:
-            # Garante tamanho de jogo esperado
-            if len(seq) != self.tamanho_jogo_padrao:
-                continue
-
-            score: ScoreDetalhado = self.ponto_c.score_sequence(seq, regime_id)
-            prot = Prototipo(
-                sequencia=seq,
-                score_total=score.score_total,
-                coerencias=score.coerencias,
-                violacoes=score.violacoes,
-                detalhes=score.detalhes,
-            )
-            avaliados.append(prot)
-
-        if not avaliados:
-            raise ValueError(
-                "Nenhum candidato pôde ser avaliado. "
-                "Verifique grupo de milhões e configurações do laboratório."
+            score: ScoreDetalhado = self.ponto_c.score_sequence(seq, regime)
+            prototipos.append(
+                Prototipo(
+                    sequencia=list(seq),
+                    score_total=float(score.score_total),
+                    coerencias=int(score.coerencias),
+                    violacoes=int(score.violacoes),
+                    detalhes=dict(score.detalhes),
+                )
             )
 
-        # Ordena por score_total (decrescente) e pega top-k
-        avaliados.sort(key=lambda p: p.score_total, reverse=True)
-        return avaliados[:k]
+        # Ordena: score_total desc, depois menos violações, depois mais coerências
+        prototipos.sort(key=lambda p: (p.score_total, -p.violacoes, p.coerencias), reverse=True)
 
-    # --------------------------------------------------------
-    #  Versão amigável para API (JSON-ready)
-    # --------------------------------------------------------
+        # Retorna topo K
+        return prototipos[: int(k)]
+
     def gerar_prototipos_json(
         self,
-        k: Optional[int] = None,
+        k: int,
         regime_id: Optional[str] = None,
         max_candidatos: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
+        incluir_contexto_dna: bool = True,
+    ) -> Dict[str, Any]:
         """
-        Wrapper que transforma Prototipo em dict pronto para JSON.
-        Ideal para uso direto no FastAPI.
+        Versão JSON-friendly para o endpoint /prototipos.
+
+        Mantém compatibilidade com o que você já está usando,
+        mas permite incluir "contexto_dna" no retorno.
         """
-        prototipos = self.gerar_prototipos(
-            k=k,
-            regime_id=regime_id,
-            max_candidatos=max_candidatos,
-        )
-        retorno: List[Dict[str, Any]] = []
+        protos = self.gerar_prototipos(k=k, regime_id=regime_id, max_candidatos=max_candidatos)
 
-        for p in prototipos:
-            retorno.append(
-                {
-                    "sequencia": p.sequencia,
-                    "score_total": p.score_total,
-                    "coerencias": p.coerencias,
-                    "violacoes": p.violacoes,
-                    "detalhes": p.detalhes,
-                }
-            )
+        payload_protos = [
+            {
+                "sequencia": p.sequencia,
+                "score_total": p.score_total,
+                "coerencias": p.coerencias,
+                "violacoes": p.violacoes,
+                "detalhes": p.detalhes,
+            }
+            for p in protos
+        ]
 
-        return retorno
+        if not incluir_contexto_dna:
+            return {"prototipos": payload_protos}
+
+        return {
+            "prototipos": payload_protos,
+            "contexto_dna": self.get_dna_contexto(),
+            "regime_usado": regime_id or self.regime_padrao,
+            "max_candidatos_usado": int(max_candidatos if max_candidatos is not None else self.max_candidatos_padrao),
+        }
 
 
-# ------------------------------------------------------------
-# Teste rápido local (não afeta o Render)
-# ------------------------------------------------------------
+# ==========================================================
+# Teste rápido local
+# ==========================================================
 if __name__ == "__main__":
     motor = MotorFGI()
-    protos = motor.gerar_prototipos(k=5, regime_id="R2")
-    for i, p in enumerate(protos, start=1):
-        print(f"# Protótipo {i}")
-        print("Sequência:", p.sequencia)
-        print("Score:", p.score_total, "Coerências:", p.coerencias, "Violações:", p.violacoes)
-        print("-" * 40)
+    out = motor.gerar_prototipos_json(k=5, regime_id="R2", max_candidatos=2000)
+    print(out)
