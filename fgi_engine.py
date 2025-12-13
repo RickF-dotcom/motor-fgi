@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import math
+import random
 
 from grupo_de_milhoes import GrupoDeMilhoes
 
@@ -29,14 +30,10 @@ class MotorFGI:
     """
     Motor principal do laboratório.
 
-    Responsabilidades:
-    - Carregar Grupo de Milhões
-    - Avaliar sequências (PONTO C / score)
-    - Gerar protótipos estruturais (LHE/LHS)
-
-    Nota (compat com seu endpoint atual):
-    - 'k' é usado como TAMANHO DA SEQUÊNCIA (ex.: 15 dezenas) E também como QUANTIDADE
-      de protótipos retornados (top-k).
+    Correção crítica (PASSO 2):
+    - Constraints NÃO SÃO "sugestões". Viram filtro duro.
+      Se violar, a sequência não entra no conjunto aprovado.
+    - Pesos servem apenas para ordenar ENTRE aprovados.
     """
 
     def __init__(
@@ -53,43 +50,28 @@ class MotorFGI:
 
         self.regime_padrao = "estavel"
 
-        # -------------------------
-        # Regimes (calibração inicial)
-        # -------------------------
-        # Ponto crítico corrigido:
-        # - "estavel" NÃO pode ter max_adjacencias=3, porque o DNA real (últimas 25)
-        #   gira perto de 8 adjacências em média. 3 quebra tudo.
         self._regimes: Dict[str, Dict[str, Any]] = {
             "estavel": {
                 "z_max_soma": 1.30,
-                "max_adjacencias": 12,     # <-- corrigido (antes 3)
+                "max_adjacencias": 3,
                 "max_desvio_pares": 2,
-                "pesos": {
-                    "soma": 1.20,
-                    "pares": 0.60,
-                    "adj": 0.60,
-                },
+                "pesos": {"soma": 1.20, "pares": 0.60, "adj": 0.60},
             },
             "tenso": {
                 "z_max_soma": 1.70,
-                "max_adjacencias": 14,
+                "max_adjacencias": 4,
                 "max_desvio_pares": 3,
-                "pesos": {
-                    "soma": 1.00,
-                    "pares": 0.45,
-                    "adj": 0.45,
-                },
+                "pesos": {"soma": 1.00, "pares": 0.45, "adj": 0.45},
             },
         }
 
     # =========================
-    # Helpers estatísticos (universo 1..N, sem reposição)
+    # Helpers estatísticos
     # =========================
 
     def _sum_stats_sem_reposicao(self, k: int) -> Tuple[float, float]:
         """
         Média e desvio padrão da SOMA ao amostrar k números de 1..N (sem reposição).
-
         Pop variance de 1..N: (N^2 - 1)/12
         Var(sum) = k * var_pop * ((N - k)/(N - 1))
         """
@@ -106,80 +88,22 @@ class MotorFGI:
         return mu, sd
 
     def _count_adjacencias(self, seq_ordenada: List[int]) -> int:
-        """
-        Conta quantos pares consecutivos existem: (x, x+1).
-        Ex.: [1,2,3,7,9,10] -> adj=3 (1-2,2-3,9-10)
-        """
         adj = 0
         for i in range(1, len(seq_ordenada)):
             if seq_ordenada[i] - seq_ordenada[i - 1] == 1:
                 adj += 1
         return adj
 
-    def _merge_pesos(
-        self,
-        base: Dict[str, float],
-        override: Optional[Dict[str, float]],
-    ) -> Dict[str, float]:
-        out = dict(base)
-        if override:
-            for k, v in override.items():
-                try:
-                    out[str(k)] = float(v)
-                except Exception:
-                    continue
-        return out
-
-    def _merge_constraints(
-        self,
-        base: Dict[str, Any],
-        override: Optional[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        out = dict(base)
-        if override:
-            for k, v in override.items():
-                out[str(k)] = v
-        return out
-
     # =========================
     # Avaliação (PONTO C)
     # =========================
 
-    def avaliar_sequencia(
-        self,
-        seq: List[int],
-        regime: str,
-        pesos_override: Optional[Dict[str, float]] = None,
-        constraints_override: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """
-        Avaliação estruturada.
-
-        Componentes atuais:
-        - Soma (z-score no universo 1..N sem reposição)
-        - Paridade (pares vs k/2)
-        - Adjacências (consecutivos)
-        """
+    def avaliar_sequencia(self, seq: List[int], regime: str) -> Dict[str, Any]:
         seq_ord = sorted(int(x) for x in seq)
         k = len(seq_ord)
 
-        cfg_base = self._regimes.get(regime, self._regimes["estavel"])
-
-        # constraints efetivas (com override)
-        constraints_base = {
-            "z_max_soma": float(cfg_base["z_max_soma"]),
-            "max_adjacencias": int(cfg_base["max_adjacencias"]),
-            "max_desvio_pares": int(cfg_base["max_desvio_pares"]),
-        }
-        constraints = self._merge_constraints(constraints_base, constraints_override)
-
-        # pesos efetivos (com override)
-        pesos_base = {
-            "soma": float(cfg_base["pesos"]["soma"]),
-            "pares": float(cfg_base["pesos"]["pares"]),
-            "adj": float(cfg_base["pesos"]["adj"]),
-        }
-        pesos = self._merge_pesos(pesos_base, pesos_override)
+        cfg = self._regimes.get(regime, self._regimes["estavel"])
+        pesos = cfg["pesos"]
 
         soma = sum(seq_ord)
         pares = sum(1 for x in seq_ord if x % 2 == 0)
@@ -189,43 +113,54 @@ class MotorFGI:
         mu_soma, sd_soma = self._sum_stats_sem_reposicao(k)
         z_soma = abs((soma - mu_soma) / sd_soma) if sd_soma > 0 else 0.0
 
+        alvo_pares = k / 2.0
+        desvio_pares = abs(pares - alvo_pares)
+
+        # ---------
+        # FILTER DURO (aqui é a correção real)
+        # ---------
+        z_max_soma = float(cfg["z_max_soma"])
+        max_adj = int(cfg["max_adjacencias"])
+        max_desvio = int(cfg["max_desvio_pares"])
+
+        violou_soma = z_soma > z_max_soma
+        violou_adj = adj > max_adj
+        violou_pares = desvio_pares > max_desvio
+
+        aprovada = not (violou_soma or violou_adj or violou_pares)
+
         coerencias = 0
         violacoes = 0
 
         # --- SOMA
-        z_max_soma = float(constraints["z_max_soma"])
-        if z_soma <= z_max_soma:
+        if not violou_soma:
             coerencias += 1
-            score_soma = 1.0 - (z_soma / max(1e-9, z_max_soma))  # 1..0
+            score_soma = 1.0 - (z_soma / z_max_soma)  # 1..0
         else:
             violacoes += 1
+            # penaliza, mas o que manda é aprovada=False
             score_soma = -min(1.0, (z_soma - z_max_soma) / 1.0)
 
         # --- PARES
-        alvo_pares = k / 2.0
-        desvio_pares = abs(pares - alvo_pares)
-        max_desvio_pares = int(constraints["max_desvio_pares"])
-        if desvio_pares <= max_desvio_pares:
+        if not violou_pares:
             coerencias += 1
-            score_pares = 1.0 - (desvio_pares / max(1.0, float(max_desvio_pares)))
+            score_pares = 1.0 - (desvio_pares / max(1.0, float(max_desvio)))
         else:
             violacoes += 1
-            score_pares = -min(1.0, (desvio_pares - float(max_desvio_pares)) / 1.0)
+            score_pares = -min(1.0, (desvio_pares - float(max_desvio)) / 1.0)
 
-        # --- ADJACÊNCIAS
-        max_adj = int(constraints["max_adjacencias"])
-        if adj <= max_adj:
+        # --- ADJ
+        if not violou_adj:
             coerencias += 1
             score_adj = 1.0 - (adj / max(1.0, float(max_adj)))
         else:
             violacoes += 1
             score_adj = -min(1.0, (adj - max_adj) / 1.0)
 
-        # Score total (ponderado)
         score_total = (
-            float(pesos["soma"]) * float(score_soma) +
-            float(pesos["pares"]) * float(score_pares) +
-            float(pesos["adj"]) * float(score_adj)
+            pesos["soma"] * score_soma +
+            pesos["pares"] * score_pares +
+            pesos["adj"]  * score_adj
         )
 
         detalhes = {
@@ -238,12 +173,17 @@ class MotorFGI:
             "impares": impares,
             "adjacencias": adj,
             "regime": regime,
+            "aprovada": aprovada,
             "componentes": {
                 "score_soma": round(score_soma, 4),
                 "score_pares": round(score_pares, 4),
                 "score_adj": round(score_adj, 4),
                 "pesos": pesos,
-                "constraints": constraints,
+                "constraints": {
+                    "z_max_soma": z_max_soma,
+                    "max_adjacencias": max_adj,
+                    "max_desvio_pares": max_desvio,
+                },
             },
         }
 
@@ -251,6 +191,7 @@ class MotorFGI:
             "score_total": float(round(score_total, 6)),
             "coerencias": int(coerencias),
             "violacoes": int(violacoes),
+            "aprovada": bool(aprovada),
             "detalhes": detalhes,
         }
 
@@ -263,46 +204,43 @@ class MotorFGI:
         k: int,
         regime_id: Optional[str] = None,
         max_candidatos: Optional[int] = None,
-        pesos_override: Optional[Dict[str, float]] = None,
-        constraints_override: Optional[Dict[str, Any]] = None,
     ) -> List[Prototipo]:
 
         regime = regime_id or self.regime_padrao
         limite = int(max_candidatos or 2000)
 
-        candidatos = self.grupo.get_candidatos(
-            k=int(k),
-            max_candidatos=limite,
-        )
+        candidatos = self.grupo.get_candidatos(k=int(k), max_candidatos=limite)
 
-        prototipos: List[Prototipo] = []
+        # Importante: candidatos vindo em ordem “baixa” tende a dar soma baixa.
+        # Embaralhar aumenta MUITO a chance de pegar somas perto de mu (≈195).
+        random.shuffle(candidatos)
+
+        aprovados: List[Prototipo] = []
+        rejeitados: List[Prototipo] = []
 
         for seq in candidatos:
-            avaliacao = self.avaliar_sequencia(
-                list(seq),
-                regime,
-                pesos_override=pesos_override,
-                constraints_override=constraints_override,
+            avaliacao = self.avaliar_sequencia(seq, regime)
+            p = Prototipo(
+                sequencia=list(seq),
+                score_total=float(avaliacao["score_total"]),
+                coerencias=int(avaliacao["coerencias"]),
+                violacoes=int(avaliacao["violacoes"]),
+                detalhes=dict(avaliacao["detalhes"]),
             )
+            if avaliacao.get("aprovada"):
+                aprovados.append(p)
+            else:
+                rejeitados.append(p)
 
-            prototipos.append(
-                Prototipo(
-                    sequencia=list(seq),
-                    score_total=float(avaliacao["score_total"]),
-                    coerencias=int(avaliacao["coerencias"]),
-                    violacoes=int(avaliacao["violacoes"]),
-                    detalhes=dict(avaliacao["detalhes"]),
-                )
-            )
+        # Ordena aprovados por score desc
+        aprovados.sort(key=lambda p: (p.score_total, -p.coerencias), reverse=True)
 
-        # Ordenação: score desc, depois MENOS violações, depois MAIS coerências
-        prototipos.sort(
-            key=lambda p: (p.score_total, -p.violacoes, p.coerencias),
-            reverse=True,
-        )
+        # Fallback: se não tiver aprovados suficientes, completa com rejeitados (mas fica claro no detalhe)
+        if len(aprovados) < int(k):
+            rejeitados.sort(key=lambda p: p.score_total, reverse=True)
+            aprovados.extend(rejeitados[: max(0, int(k) - len(aprovados))])
 
-        # Mantém compat: retorna TOP k protótipos
-        return prototipos[: int(k)]
+        return aprovados[: int(k)]
 
     # =========================
     # JSON-friendly (API)
@@ -314,17 +252,9 @@ class MotorFGI:
         regime_id: Optional[str] = None,
         max_candidatos: Optional[int] = None,
         incluir_contexto_dna: bool = True,
-        pesos_override: Optional[Dict[str, float]] = None,
-        constraints_override: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
 
-        protos = self.gerar_prototipos(
-            k=int(k),
-            regime_id=regime_id,
-            max_candidatos=max_candidatos,
-            pesos_override=pesos_override,
-            constraints_override=constraints_override,
-        )
+        protos = self.gerar_prototipos(k=int(k), regime_id=regime_id, max_candidatos=max_candidatos)
 
         payload = [
             {
@@ -341,10 +271,6 @@ class MotorFGI:
             "prototipos": payload,
             "regime_usado": regime_id or self.regime_padrao,
             "max_candidatos_usado": int(max_candidatos or 2000),
-            "overrides_usados": {
-                "pesos_override": pesos_override or {},
-                "constraints_override": constraints_override or {},
-            },
         }
 
         if incluir_contexto_dna:
@@ -354,23 +280,3 @@ class MotorFGI:
             }
 
         return resp
-
-
-# =========================
-# TESTE LOCAL DIRETO
-# =========================
-
-if __name__ == "__main__":
-    motor = MotorFGI(
-        historico_csv="lotofacil_ultimos_25_concursos.csv",
-        universo_max=25,
-    )
-
-    resultado = motor.gerar_prototipos_json(
-        k=15,
-        regime_id="estavel",
-        max_candidatos=2000,
-        incluir_contexto_dna=True,
-    )
-
-    print(resultado)
