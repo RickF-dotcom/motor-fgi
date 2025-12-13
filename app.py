@@ -1,7 +1,8 @@
+
 from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
 from pathlib import Path
 import yaml
@@ -12,7 +13,7 @@ from regime_detector import RegimeDetector
 
 app = FastAPI(
     title="ATHENA LABORATORIO PMF",
-    version="0.2.0",
+    version="0.2.1",
     description="Backend do MotorFGI + PONTO C + RegimeDetector (DNA + regime).",
 )
 
@@ -34,8 +35,8 @@ def _load_yaml(path: Path) -> Dict[str, Any]:
 
 LAB_CONFIG: Dict[str, Any] = _load_yaml(LAB_CONFIG_PATH)
 
-# IMPORTANTÍSSIMO: carrega o histórico (últimos 25) no MotorFGI
-motor_fgi = MotorFGI(historico_csv=str(HISTORICO_LAST25_CSV), universo_max=25)
+# Motor (usa o grupo de milhões; se você quiser passar CSV aqui depois, a gente faz)
+motor_fgi = MotorFGI()
 
 
 class PrototipoRequest(BaseModel):
@@ -44,9 +45,9 @@ class PrototipoRequest(BaseModel):
     max_candidatos: Optional[int] = 2000
     incluir_contexto_dna: bool = True
 
-    # overrides do request (Swagger)
-    pesos_override: Optional[Dict[str, float]] = None
-    constraints_override: Optional[Dict[str, Any]] = None
+    # Overrides (o Swagger vai aceitar e o motor vai aplicar)
+    pesos_override: Optional[Dict[str, float]] = Field(default=None)
+    constraints_override: Optional[Dict[str, Any]] = Field(default=None)
 
 
 @app.get("/lab/config")
@@ -59,6 +60,7 @@ def status():
     return {
         "status": "online",
         "versao_laboratorio": LAB_CONFIG.get("versao_laboratorio", "desconhecida"),
+        "app_version": app.version,
     }
 
 
@@ -97,7 +99,7 @@ def gerar_prototipos(req: PrototipoRequest):
             k=req.k,
             regime_id=req.regime_id,
             max_candidatos=req.max_candidatos,
-            incluir_contexto_dna=False,
+            incluir_contexto_dna=False,  # controla aqui fora
             pesos_override=req.pesos_override,
             constraints_override=req.constraints_override,
         )
@@ -110,12 +112,10 @@ def gerar_prototipos(req: PrototipoRequest):
             historico_csv=HISTORICO_LAST25_CSV,
             historico_total_csv=HISTORICO_TOTAL_CSV if HISTORICO_TOTAL_CSV.exists() else None,
         )
-        dna = detector.extrair_dna()
-        regime = detector.detectar_regime()
 
         out["contexto_lab"] = {
-            "dna_last25": dna,
-            "regime_atual": regime,
+            "dna_last25": detector.extrair_dna(),
+            "regime_atual": detector.detectar_regime(),
         }
         return out
 
