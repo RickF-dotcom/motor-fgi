@@ -29,9 +29,9 @@ class MotorFGI:
     """
     Motor de avaliação / geração de protótipos.
 
-    Este arquivo é propositalmente "contrato-resiliente":
+    Contrato-resiliente:
     - aceita overrides novos sem quebrar (via **kwargs e campos opcionais)
-    - expõe set_dna_anchor() para o app.py não estourar 500
+    - expõe set_dna_anchor() com assinatura compatível com o app.py atual
     """
 
     def __init__(
@@ -46,10 +46,8 @@ class MotorFGI:
             historico_csv=Path(historico_csv) if historico_csv else None,
         )
 
-        # defaults (podem ser alterados por regime)
         self.regime_padrao = "estavel"
 
-        # Regras/limites por regime (mantém compatibilidade com os JSONs que você já viu)
         self._regimes: Dict[str, Dict[str, Any]] = {
             "estavel": {
                 "z_max_soma": 1.30,
@@ -70,16 +68,51 @@ class MotorFGI:
         self._dna_anchor_active: bool = False
 
     # ------------------------------------------------------------
-    # Contrato exigido pelo app.py (corrige o 500)
+    # Contrato exigido pelo app.py (corrige 500 de atributo/assinatura)
     # ------------------------------------------------------------
 
-    def set_dna_anchor(self, dna_anchor: Optional[Dict[str, Any]]) -> None:
+    def set_dna_anchor(
+        self,
+        dna_anchor: Optional[Dict[str, Any]] = None,
+        *,
+        dna_last25: Optional[Dict[str, Any]] = None,
+        window: Optional[int] = None,
+        **_ignored: Any,
+    ) -> None:
         """
-        Define o "DNA anchor" (contexto do laboratório) sem acoplar a lógica do score a ele ainda.
-        Objetivo aqui é: NÃO quebrar o contrato e permitir evolução incremental.
+        Suporta os dois formatos:
+
+        (A) formato novo (do seu app.py):
+            set_dna_anchor(dna_last25=<dict>, window=12)
+
+        (B) formato antigo:
+            set_dna_anchor(dna_anchor=<dict>)
+
+        Qualquer kwargs extra é ignorado (resiliência).
         """
-        self._dna_anchor = dna_anchor or None
-        self._dna_anchor_active = bool(dna_anchor)
+        if dna_anchor is not None:
+            payload = dna_anchor
+        else:
+            # monta payload "padrão laboratório"
+            payload = {
+                "dna_last25": dna_last25,
+                "window": int(window) if window is not None else None,
+            }
+
+        # normaliza: se não veio nada útil, desativa
+        if not payload or (isinstance(payload, dict) and all(v is None for v in payload.values())):
+            self._dna_anchor = None
+            self._dna_anchor_active = False
+            return
+
+        if not isinstance(payload, dict):
+            # garante que não explode por tipo bizarro vindo do app
+            self._dna_anchor = {"raw": payload}
+            self._dna_anchor_active = True
+            return
+
+        self._dna_anchor = payload
+        self._dna_anchor_active = True
 
     def get_dna_anchor(self) -> Dict[str, Any]:
         return {
@@ -164,24 +197,18 @@ class MotorFGI:
         mu_soma, sd_soma = self._sum_stats_sem_reposicao(k)
         z_soma = 0.0 if sd_soma == 0 else (soma - mu_soma) / sd_soma
 
-        # ---- componentes (para bater com seus outputs)
-        # score_soma:
-        # - se |z| <= z_max => 0 (sem penalização)
-        # - se exceder => penaliza pelo excedente (negativo)
+        # componentes
         excedente = max(0.0, abs(z_soma) - z_max_soma)
         score_soma = -excedente
 
-        # score_pares:
-        # 1 - (desvio / max_desvio_pares) clamp [0, 1]
         alvo_pares = k / 2.0
         desvio_pares = abs(pares - alvo_pares)
-        score_pares = 0.0
         if max_desvio_pares > 0:
             score_pares = 1.0 - (desvio_pares / float(max_desvio_pares))
             score_pares = max(0.0, min(1.0, score_pares))
+        else:
+            score_pares = 0.0
 
-        # score_adj:
-        # 0 se ok, -1 se violou
         score_adj = 0.0 if adj <= max_adj else -1.0
 
         score_total = (
@@ -252,22 +279,10 @@ class MotorFGI:
         top_n: int = 30,
         **_ignored: Any,
     ) -> Dict[str, Any]:
-        """
-        Retorna payload compatível com o Swagger:
-        - prototipos (lista)
-        - regime_usado
-        - max_candidatos_usado
-        - overrides_usados
-        - contexto_lab (quando incluir_contexto_dna=True e anchor ativo)
-
-        Obs: parâmetros windows/pesos_windows/pesos_metricas estão aceitos para NÃO quebrar
-        o contrato enquanto evoluímos o temporal_fractal_engine.
-        """
         k = int(k)
         top_n = int(top_n)
         max_candidatos = int(max_candidatos)
 
-        # Ponto crítico: se o app injetou DNA antes, expomos no payload sem quebrar.
         contexto_lab = None
         if incluir_contexto_dna and self._dna_anchor_active:
             contexto_lab = self._dna_anchor
@@ -285,7 +300,6 @@ class MotorFGI:
             )
             prototipos.append(p)
 
-        # melhor score primeiro
         prototipos.sort(key=lambda x: x.score_total, reverse=True)
         prototipos = prototipos[: max(1, top_n)]
 
@@ -310,4 +324,4 @@ class MotorFGI:
                 "pesos_metricas": pesos_metricas or None,
             },
             "contexto_lab": contexto_lab,
-                }
+}
