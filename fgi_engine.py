@@ -8,6 +8,10 @@ import math
 from grupo_de_milhoes import GrupoDeMilhoes
 
 
+# =========================
+# Estrutura de Protótipo
+# =========================
+
 @dataclass
 class Prototipo:
     sequencia: List[int]
@@ -17,15 +21,22 @@ class Prototipo:
     detalhes: Dict[str, Any]
 
 
+# =========================
+# MotorFGI
+# =========================
+
 class MotorFGI:
     """
     Motor principal do laboratório.
 
-    Importante:
-    - 'k' é tamanho da sequência e também a quantidade de protótipos retornados (compat do endpoint).
-    - Agora aceita overrides:
-        * pesos_override: altera pesos do score (soma/pares/adj)
-        * constraints_override: altera limites do regime (z_max_soma, max_adjacencias, max_desvio_pares)
+    Responsabilidades:
+    - Carregar Grupo de Milhões
+    - Avaliar sequências (PONTO C / score)
+    - Gerar protótipos estruturais (LHE/LHS)
+
+    Nota (compat com seu endpoint atual):
+    - 'k' é usado como TAMANHO DA SEQUÊNCIA (ex.: 15 dezenas) E também como QUANTIDADE
+      de protótipos retornados (top-k).
     """
 
     def __init__(
@@ -42,22 +53,46 @@ class MotorFGI:
 
         self.regime_padrao = "estavel"
 
+        # -------------------------
+        # Regimes (calibração inicial)
+        # -------------------------
+        # Ponto crítico corrigido:
+        # - "estavel" NÃO pode ter max_adjacencias=3, porque o DNA real (últimas 25)
+        #   gira perto de 8 adjacências em média. 3 quebra tudo.
         self._regimes: Dict[str, Dict[str, Any]] = {
             "estavel": {
                 "z_max_soma": 1.30,
-                "max_adjacencias": 3,
+                "max_adjacencias": 12,     # <-- corrigido (antes 3)
                 "max_desvio_pares": 2,
-                "pesos": {"soma": 1.20, "pares": 0.60, "adj": 0.60},
+                "pesos": {
+                    "soma": 1.20,
+                    "pares": 0.60,
+                    "adj": 0.60,
+                },
             },
             "tenso": {
                 "z_max_soma": 1.70,
-                "max_adjacencias": 4,
+                "max_adjacencias": 14,
                 "max_desvio_pares": 3,
-                "pesos": {"soma": 1.00, "pares": 0.45, "adj": 0.45},
+                "pesos": {
+                    "soma": 1.00,
+                    "pares": 0.45,
+                    "adj": 0.45,
+                },
             },
         }
 
+    # =========================
+    # Helpers estatísticos (universo 1..N, sem reposição)
+    # =========================
+
     def _sum_stats_sem_reposicao(self, k: int) -> Tuple[float, float]:
+        """
+        Média e desvio padrão da SOMA ao amostrar k números de 1..N (sem reposição).
+
+        Pop variance de 1..N: (N^2 - 1)/12
+        Var(sum) = k * var_pop * ((N - k)/(N - 1))
+        """
         N = self.universo_max
         k = int(k)
         if k <= 0 or k > N:
@@ -71,43 +106,44 @@ class MotorFGI:
         return mu, sd
 
     def _count_adjacencias(self, seq_ordenada: List[int]) -> int:
+        """
+        Conta quantos pares consecutivos existem: (x, x+1).
+        Ex.: [1,2,3,7,9,10] -> adj=3 (1-2,2-3,9-10)
+        """
         adj = 0
         for i in range(1, len(seq_ordenada)):
             if seq_ordenada[i] - seq_ordenada[i - 1] == 1:
                 adj += 1
         return adj
 
-    def _cfg_regime_com_overrides(
+    def _merge_pesos(
         self,
-        regime: str,
-        pesos_override: Optional[Dict[str, float]] = None,
-        constraints_override: Optional[Dict[str, Any]] = None,
+        base: Dict[str, float],
+        override: Optional[Dict[str, float]],
+    ) -> Dict[str, float]:
+        out = dict(base)
+        if override:
+            for k, v in override.items():
+                try:
+                    out[str(k)] = float(v)
+                except Exception:
+                    continue
+        return out
+
+    def _merge_constraints(
+        self,
+        base: Dict[str, Any],
+        override: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        base = dict(self._regimes.get(regime, self._regimes["estavel"]))
+        out = dict(base)
+        if override:
+            for k, v in override.items():
+                out[str(k)] = v
+        return out
 
-        # pesos
-        pesos = dict(base.get("pesos", {}))
-        if pesos_override:
-            for k, v in pesos_override.items():
-                if k in ("soma", "pares", "adj"):
-                    try:
-                        pesos[k] = float(v)
-                    except Exception:
-                        pass
-        base["pesos"] = pesos
-
-        # constraints
-        if constraints_override:
-            for k, v in constraints_override.items():
-                if k in ("z_max_soma", "max_adjacencias", "max_desvio_pares"):
-                    base[k] = v
-
-        # sanidade mínima
-        base["z_max_soma"] = float(base.get("z_max_soma", 1.30))
-        base["max_adjacencias"] = int(base.get("max_adjacencias", 3))
-        base["max_desvio_pares"] = int(base.get("max_desvio_pares", 2))
-
-        return base
+    # =========================
+    # Avaliação (PONTO C)
+    # =========================
 
     def avaliar_sequencia(
         self,
@@ -116,15 +152,34 @@ class MotorFGI:
         pesos_override: Optional[Dict[str, float]] = None,
         constraints_override: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """
+        Avaliação estruturada.
+
+        Componentes atuais:
+        - Soma (z-score no universo 1..N sem reposição)
+        - Paridade (pares vs k/2)
+        - Adjacências (consecutivos)
+        """
         seq_ord = sorted(int(x) for x in seq)
         k = len(seq_ord)
 
-        cfg = self._cfg_regime_com_overrides(
-            regime=regime,
-            pesos_override=pesos_override,
-            constraints_override=constraints_override,
-        )
-        pesos = cfg["pesos"]
+        cfg_base = self._regimes.get(regime, self._regimes["estavel"])
+
+        # constraints efetivas (com override)
+        constraints_base = {
+            "z_max_soma": float(cfg_base["z_max_soma"]),
+            "max_adjacencias": int(cfg_base["max_adjacencias"]),
+            "max_desvio_pares": int(cfg_base["max_desvio_pares"]),
+        }
+        constraints = self._merge_constraints(constraints_base, constraints_override)
+
+        # pesos efetivos (com override)
+        pesos_base = {
+            "soma": float(cfg_base["pesos"]["soma"]),
+            "pares": float(cfg_base["pesos"]["pares"]),
+            "adj": float(cfg_base["pesos"]["adj"]),
+        }
+        pesos = self._merge_pesos(pesos_base, pesos_override)
 
         soma = sum(seq_ord)
         pares = sum(1 for x in seq_ord if x % 2 == 0)
@@ -137,28 +192,28 @@ class MotorFGI:
         coerencias = 0
         violacoes = 0
 
-        # SOMA
-        z_max = float(cfg["z_max_soma"])
-        if z_soma <= z_max:
+        # --- SOMA
+        z_max_soma = float(constraints["z_max_soma"])
+        if z_soma <= z_max_soma:
             coerencias += 1
-            score_soma = 1.0 - (z_soma / max(1e-9, z_max))
+            score_soma = 1.0 - (z_soma / max(1e-9, z_max_soma))  # 1..0
         else:
             violacoes += 1
-            score_soma = -min(1.0, (z_soma - z_max) / 1.0)
+            score_soma = -min(1.0, (z_soma - z_max_soma) / 1.0)
 
-        # PARES
+        # --- PARES
         alvo_pares = k / 2.0
         desvio_pares = abs(pares - alvo_pares)
-        max_desvio = int(cfg["max_desvio_pares"])
-        if desvio_pares <= max_desvio:
+        max_desvio_pares = int(constraints["max_desvio_pares"])
+        if desvio_pares <= max_desvio_pares:
             coerencias += 1
-            score_pares = 1.0 - (desvio_pares / max(1.0, float(max_desvio)))
+            score_pares = 1.0 - (desvio_pares / max(1.0, float(max_desvio_pares)))
         else:
             violacoes += 1
-            score_pares = -min(1.0, (desvio_pares - float(max_desvio)) / 1.0)
+            score_pares = -min(1.0, (desvio_pares - float(max_desvio_pares)) / 1.0)
 
-        # ADJ
-        max_adj = int(cfg["max_adjacencias"])
+        # --- ADJACÊNCIAS
+        max_adj = int(constraints["max_adjacencias"])
         if adj <= max_adj:
             coerencias += 1
             score_adj = 1.0 - (adj / max(1.0, float(max_adj)))
@@ -166,10 +221,11 @@ class MotorFGI:
             violacoes += 1
             score_adj = -min(1.0, (adj - max_adj) / 1.0)
 
+        # Score total (ponderado)
         score_total = (
-            pesos["soma"] * score_soma +
-            pesos["pares"] * score_pares +
-            pesos["adj"] * score_adj
+            float(pesos["soma"]) * float(score_soma) +
+            float(pesos["pares"]) * float(score_pares) +
+            float(pesos["adj"]) * float(score_adj)
         )
 
         detalhes = {
@@ -186,12 +242,8 @@ class MotorFGI:
                 "score_soma": round(score_soma, 4),
                 "score_pares": round(score_pares, 4),
                 "score_adj": round(score_adj, 4),
-                "pesos": dict(pesos),
-                "constraints": {
-                    "z_max_soma": cfg["z_max_soma"],
-                    "max_adjacencias": cfg["max_adjacencias"],
-                    "max_desvio_pares": cfg["max_desvio_pares"],
-                },
+                "pesos": pesos,
+                "constraints": constraints,
             },
         }
 
@@ -202,6 +254,10 @@ class MotorFGI:
             "detalhes": detalhes,
         }
 
+    # =========================
+    # Geração de Protótipos
+    # =========================
+
     def gerar_prototipos(
         self,
         k: int,
@@ -210,6 +266,7 @@ class MotorFGI:
         pesos_override: Optional[Dict[str, float]] = None,
         constraints_override: Optional[Dict[str, Any]] = None,
     ) -> List[Prototipo]:
+
         regime = regime_id or self.regime_padrao
         limite = int(max_candidatos or 2000)
 
@@ -219,13 +276,15 @@ class MotorFGI:
         )
 
         prototipos: List[Prototipo] = []
+
         for seq in candidatos:
             avaliacao = self.avaliar_sequencia(
-                seq=list(seq),
-                regime=regime,
+                list(seq),
+                regime,
                 pesos_override=pesos_override,
                 constraints_override=constraints_override,
             )
+
             prototipos.append(
                 Prototipo(
                     sequencia=list(seq),
@@ -236,13 +295,18 @@ class MotorFGI:
                 )
             )
 
-        # score desc, menos violações, mais coerências
+        # Ordenação: score desc, depois MENOS violações, depois MAIS coerências
         prototipos.sort(
             key=lambda p: (p.score_total, -p.violacoes, p.coerencias),
             reverse=True,
         )
 
+        # Mantém compat: retorna TOP k protótipos
         return prototipos[: int(k)]
+
+    # =========================
+    # JSON-friendly (API)
+    # =========================
 
     def gerar_prototipos_json(
         self,
@@ -253,6 +317,7 @@ class MotorFGI:
         pesos_override: Optional[Dict[str, float]] = None,
         constraints_override: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+
         protos = self.gerar_prototipos(
             k=int(k),
             regime_id=regime_id,
@@ -289,3 +354,23 @@ class MotorFGI:
             }
 
         return resp
+
+
+# =========================
+# TESTE LOCAL DIRETO
+# =========================
+
+if __name__ == "__main__":
+    motor = MotorFGI(
+        historico_csv="lotofacil_ultimos_25_concursos.csv",
+        universo_max=25,
+    )
+
+    resultado = motor.gerar_prototipos_json(
+        k=15,
+        regime_id="estavel",
+        max_candidatos=2000,
+        incluir_contexto_dna=True,
+    )
+
+    print(resultado)
