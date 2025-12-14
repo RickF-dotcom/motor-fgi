@@ -33,7 +33,7 @@ def _load_yaml(path: Path) -> Dict[str, Any]:
     return data
 
 
-motor_fgi = MotorFGI()
+motor_fgi = MotorFGI(historico_csv=str(HISTORICO_LAST25_CSV))
 
 
 class PrototipoRequest(BaseModel):
@@ -42,12 +42,18 @@ class PrototipoRequest(BaseModel):
     max_candidatos: Optional[int] = 2000
     incluir_contexto_dna: bool = True
 
-    # âncora fractal (janela)
+    # Âncora fractal (qual janela do DNA usar como referência)
     dna_anchor_window: int = 12
 
-    # overrides experimentais (controlados)
+    # Overrides (experimentos controlados)
     pesos_override: Optional[Dict[str, float]] = None
     constraints_override: Optional[Dict[str, Any]] = None
+
+    # compat (se o Swagger tiver isso em algum momento)
+    windows: Optional[list[int]] = None
+    pesos_windows: Optional[Dict[str, float]] = None
+    pesos_metricas: Optional[Dict[str, float]] = None
+    top_n: int = 30
 
 
 @app.get("/lab/status")
@@ -91,31 +97,31 @@ def gerar_prototipos(req: PrototipoRequest):
             historico_csv=HISTORICO_LAST25_CSV,
             historico_total_csv=HISTORICO_TOTAL_CSV if HISTORICO_TOTAL_CSV.exists() else None,
         )
-
         dna = detector.extrair_dna()
         regime = detector.detectar_regime()
 
-        # ✅ ÂNCORA: o MotorFGI atual aceita 1 argumento posicional (dna_anchor: dict)
-        dna_anchor = {
-            "dna_last25": dna,
+        # Âncora completa (DNA + regime) — o motor decide como usar.
+        anchor = {
             "window": int(req.dna_anchor_window),
+            "dna_last25": dna,
+            "regime_atual": regime,
         }
-        motor_fgi.set_dna_anchor(dna_anchor)
+
+        # IMPORTANTÍSSIMO: agora o set_dna_anchor é resiliente (aceita dict ou kwargs)
+        motor_fgi.set_dna_anchor(anchor)
 
         out = motor_fgi.gerar_prototipos_json(
             k=req.k,
             regime_id=req.regime_id,
             max_candidatos=req.max_candidatos,
-            incluir_contexto_dna=False,  # a gente controla manualmente aqui
+            incluir_contexto_dna=req.incluir_contexto_dna,
             pesos_override=req.pesos_override,
             constraints_override=req.constraints_override,
+            windows=req.windows,
+            pesos_windows=req.pesos_windows,
+            pesos_metricas=req.pesos_metricas,
+            top_n=req.top_n,
         )
-
-        if req.incluir_contexto_dna:
-            out["contexto_lab"] = {
-                "dna_last25": dna,
-                "regime_atual": regime,
-            }
 
         return out
 
