@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -29,11 +30,11 @@ class MotorFGI:
     """
     Motor de avaliação / geração de protótipos.
 
-    Objetivos:
-    1) Manter compatibilidade com o payload atual (Swagger/Render)
-    2) Ser resiliente a novos parâmetros (aceita **kwargs)
-    3) Adicionar camada discriminante: score_fractal (DNA anchor)
-       sem quebrar o score estrutural existente.
+    Objetivo desta versão:
+    - manter contrato e payloads estáveis
+    - aceitar overrides sem quebrar
+    - suportar âncora DNA fractal (ex: DNA(12))
+    - tornar ADJACÊNCIAS uma métrica CONTÍNUA ancorada no DNA (melhora discriminação)
     """
 
     def __init__(
@@ -50,154 +51,104 @@ class MotorFGI:
 
         self.regime_padrao = "estavel"
 
-        # Regras/limites por regime (compat com JSONs anteriores)
+        # Regras/limites por regime (mantém compatibilidade)
         self._regimes: Dict[str, Dict[str, Any]] = {
             "estavel": {
                 "z_max_soma": 1.30,
-                "max_adjacencias": 3,
+                "max_adjacencias": 3,     # fallback (se não houver DNA anchor)
                 "max_desvio_pares": 2,
                 "pesos": {"soma": 1.2, "pares": 0.6, "adj": 0.6},
             },
             "tenso": {
                 "z_max_soma": 1.70,
-                "max_adjacencias": 4,
+                "max_adjacencias": 4,     # fallback (se não houver DNA anchor)
                 "max_desvio_pares": 3,
                 "pesos": {"soma": 1.0, "pares": 0.45, "adj": 0.45},
             },
         }
 
-        # DNA anchor (injetado pelo app antes do /prototipos)
+        # DNA anchor (injetado pelo app)
+        self._dna_anchor: Optional[Dict[str, Any]] = None
         self._dna_anchor_active: bool = False
-        self._dna_anchor_window: Optional[int] = None
 
-        # alvos (médias) para a janela escolhida (ex: DNA(12))
-        self._anchor_targets: Dict[str, float] = {}
-
-        # desvios (std) usados para normalização do score_fractal
-        # (tentamos puxar do baseline do regime_detector; se não vier, usamos fallback)
-        self._anchor_stds: Dict[str, float] = {
-            "soma": 18.25,
-            "impares": 1.37,
-            "faixa_1_13": 1.33,
-            "adjacencias": 2.01,
-            "repeticao": 1.70,
-        }
+        # params derivados do DNA (quando ativo)
+        self._adj_target: Optional[float] = None
+        self._adj_sigma: Optional[float] = None
+        self._adj_window: Optional[int] = None
 
     # ------------------------------------------------------------
-    # Contrato para o app.py (aceita assinaturas diferentes)
+    # Contrato: app.py chama set_dna_anchor(...)
     # ------------------------------------------------------------
 
     def set_dna_anchor(self, *args: Any, **kwargs: Any) -> None:
         """
-        Aceita 2 formatos (sem quebrar):
+        Aceita chamadas antigas e novas sem quebrar.
 
-        1) set_dna_anchor(dna_anchor: dict)  [formato antigo]
-        2) set_dna_anchor(dna_last25=<dict>, window=<int>)  [formato do seu app.py atual]
-
-        O anchor usado aqui é um "alvo" de médias do DNA para uma janela (ex: 12).
+        Suporta:
+          - set_dna_anchor(dna_anchor_dict)
+          - set_dna_anchor(dna_last25=<dna_dict>, window=<int>)
         """
         dna_anchor = None
         window = None
 
-        # Formato 1 (posicional)
-        if args and isinstance(args[0], dict):
-            dna_anchor = args[0]
+        if args:
+            # modo antigo: set_dna_anchor(dna_anchor_dict)
+            dna_anchor = args[0] if len(args) >= 1 else None
 
-        # Formato 2 (kwargs)
-        if "dna_last25" in kwargs and isinstance(kwargs["dna_last25"], dict):
-            dna_anchor = kwargs["dna_last25"]
+        if "dna_anchor" in kwargs:
+            dna_anchor = kwargs.get("dna_anchor")
+
+        if "dna_last25" in kwargs:
+            dna_anchor = kwargs.get("dna_last25")
+
         if "window" in kwargs:
+            window = kwargs.get("window")
+
+        if "dna_anchor_window" in kwargs:
+            window = kwargs.get("dna_anchor_window")
+
+        self._dna_anchor = dna_anchor or None
+        self._dna_anchor_active = bool(self._dna_anchor)
+
+        # deriva target/sigma de adjacências a partir do DNA de janelas
+        self._adj_target = None
+        self._adj_sigma = None
+        self._adj_window = None
+
+        if self._dna_anchor_active and isinstance(self._dna_anchor, dict):
             try:
-                window = int(kwargs["window"])
+                # tenta puxar do formato: dna["janelas"][str(window)]["adjacencias_media"]
+                janelas = self._dna_anchor.get("janelas") or {}
+                if window is None:
+                    window = 12  # default prático
+                wkey = str(int(window))
+
+                bloco = janelas.get(wkey) or {}
+                adj_target = bloco.get("adjacencias_media", None)
+
+                if adj_target is not None:
+                    adj_target = float(adj_target)
+
+                    # sigma heurístico: precisa dar gradiente, não pode ser “duro”
+                    # Regra: pelo menos 1.5, e proporcional ao alvo.
+                    adj_sigma = max(1.5, adj_target * 0.25)
+
+                    self._adj_target = adj_target
+                    self._adj_sigma = adj_sigma
+                    self._adj_window = int(window)
             except Exception:
-                window = None
-
-        # fallback: se veio "dna_anchor" por kwargs
-        if dna_anchor is None and "dna_anchor" in kwargs and isinstance(kwargs["dna_anchor"], dict):
-            dna_anchor = kwargs["dna_anchor"]
-
-        # Se não veio nada, desativa
-        if not dna_anchor:
-            self._dna_anchor_active = False
-            self._dna_anchor_window = None
-            self._anchor_targets = {}
-            return
-
-        # Tentamos localizar o dicionário de janelas em formatos possíveis:
-        # - {"janelas": {...}}
-        # - {"dna": {"janelas": {...}}}
-        janelas = None
-        if isinstance(dna_anchor.get("janelas"), dict):
-            janelas = dna_anchor["janelas"]
-        elif isinstance(dna_anchor.get("dna"), dict) and isinstance(dna_anchor["dna"].get("janelas"), dict):
-            janelas = dna_anchor["dna"]["janelas"]
-
-        # Se não tem janelas, ativa mas sem targets (não quebra)
-        if not isinstance(janelas, dict):
-            self._dna_anchor_active = True
-            self._dna_anchor_window = window
-            self._anchor_targets = {}
-            return
-
-        # Se window não foi passado, escolhe 12 como padrão (boa âncora)
-        if window is None:
-            window = 12
-
-        win_key = str(window)
-        alvo = janelas.get(win_key)
-
-        # Se não existir exatamente, tenta fallback: 12 -> 10 -> 15 -> 25
-        if not isinstance(alvo, dict):
-            for alt in ("12", "10", "15", "25", "7", "20"):
-                if isinstance(janelas.get(alt), dict):
-                    alvo = janelas[alt]
-                    window = int(alt)
-                    break
-
-        if not isinstance(alvo, dict):
-            self._dna_anchor_active = True
-            self._dna_anchor_window = window
-            self._anchor_targets = {}
-            return
-
-        # Targets (médias) — nomes batendo com seus JSONs
-        # Alguns JSONs usam "adjacencias_media" e outros "adjacencias_media" (sem acento).
-        self._anchor_targets = {
-            "soma": float(alvo.get("soma_media", 0.0) or 0.0),
-            "impares": float(alvo.get("impares_media", 0.0) or 0.0),
-            "faixa_1_13": float(alvo.get("faixa_1_13_media", 0.0) or 0.0),
-            "adjacencias": float(alvo.get("adjacencias_media", 0.0) or 0.0),
-            "repeticao": float(alvo.get("repeticao_media", 0.0) or 0.0),
-        }
-
-        # Se o dna_anchor também trouxer baseline stds (do regime_detector), usamos
-        # Possível formato:
-        # dna_anchor["regime_atual"]["baseline"]["stds"][...]
-        try:
-            reg = dna_anchor.get("regime_atual") or dna_anchor.get("baseline") or {}
-            if isinstance(reg, dict) and isinstance(reg.get("baseline"), dict):
-                b = reg["baseline"]
-            else:
-                b = reg
-            stds = None
-            if isinstance(b, dict) and isinstance(b.get("stds"), dict):
-                stds = b["stds"]
-            if isinstance(stds, dict):
-                for k in self._anchor_stds.keys():
-                    if k in stds and stds[k] is not None:
-                        self._anchor_stds[k] = float(stds[k])
-        except Exception:
-            pass
-
-        self._dna_anchor_active = True
-        self._dna_anchor_window = window
+                # se falhar, só não ativa os parâmetros derivados
+                self._adj_target = None
+                self._adj_sigma = None
+                self._adj_window = None
 
     def get_dna_anchor(self) -> Dict[str, Any]:
         return {
             "ativo": self._dna_anchor_active,
-            "window": self._dna_anchor_window,
-            "targets": self._anchor_targets if self._dna_anchor_active else None,
-            "stds": self._anchor_stds if self._dna_anchor_active else None,
+            "payload": self._dna_anchor if self._dna_anchor_active else None,
+            "adj_target": self._adj_target,
+            "adj_sigma": self._adj_sigma,
+            "adj_window": self._adj_window,
         }
 
     # ------------------------------------------------------------
@@ -220,120 +171,38 @@ class MotorFGI:
     def _count_adjacencias(self, seq: List[int]) -> int:
         if not seq:
             return 0
-        s = sorted(seq)
+        s = sorted(int(x) for x in seq)
         adj = 0
         for i in range(1, len(s)):
             if s[i] == s[i - 1] + 1:
                 adj += 1
         return adj
 
-    def _count_faixa_1_13(self, seq: List[int]) -> int:
-        return sum(1 for x in seq if 1 <= x <= 13)
-
     # ------------------------------------------------------------
-    # Score fractal (camada discriminante)
+    # Componentes de score
     # ------------------------------------------------------------
 
-    def _score_fractal(
-        self,
-        seq: List[int],
-        k: int,
-        pesos_metricas: Optional[Dict[str, float]] = None,
-    ) -> Tuple[float, Dict[str, Any]]:
+    def _score_adj_anchor(self, adj: int) -> Tuple[float, bool]:
         """
-        Mede "proximidade" da sequência ao DNA-anchor (janela escolhida).
-        Retorna (score_fractal, detalhes_fractal)
-
-        Estratégia:
-        - calcula métricas da seq
-        - calcula z-diffs (diferença / std)
-        - agrega por pesos
-        - score = 1 - dist (clamp)  -> quanto menor a distância, maior o score
+        Score contínuo de adjacências ancorado no DNA:
+          score_adj = 1 - |adj - target|/sigma   (clamp [-1, 1])
+        coerente = True se distância <= 2*sigma (janela ampla)
         """
-        if not (self._dna_anchor_active and self._anchor_targets):
-            return 0.0, {
-                "ativo": False,
-                "motivo": "anchor_inativo_ou_sem_targets",
-            }
+        if self._adj_target is None or self._adj_sigma is None:
+            return 0.0, True
 
-        seq_sorted = sorted(seq)
-        soma = float(sum(seq_sorted))
-        impares = float(sum(1 for x in seq_sorted if x % 2 != 0))
-        faixa = float(self._count_faixa_1_13(seq_sorted))
-        adj = float(self._count_adjacencias(seq_sorted))
+        target = float(self._adj_target)
+        sigma = float(self._adj_sigma)
 
-        # repetição: sem acesso ao “último concurso” aqui, não dá pra medir de forma correta.
-        # então não usamos repeticao como distância (peso 0 por padrão).
-        repeticao = 0.0
+        dist = abs(float(adj) - target)
+        raw = 1.0 - (dist / max(1e-9, sigma))
+        score = max(-1.0, min(1.0, raw))
 
-        # pesos default (foco no que a gente mede bem agora)
-        w = {
-            "soma": 0.40,
-            "impares": 0.25,
-            "faixa_1_13": 0.20,
-            "adjacencias": 0.15,
-            "repeticao": 0.00,
-        }
-        if pesos_metricas:
-            for kk, vv in pesos_metricas.items():
-                if kk in w:
-                    w[kk] = float(vv)
-
-        # normaliza pesos (evita soma != 1)
-        wsum = sum(max(0.0, v) for v in w.values())
-        if wsum <= 0:
-            wsum = 1.0
-        w = {kk: max(0.0, vv) / wsum for kk, vv in w.items()}
-
-        def zdiff(val: float, target: float, std: float) -> float:
-            s = float(std) if std and std > 1e-9 else 1.0
-            return abs(val - float(target)) / s
-
-        z_soma = zdiff(soma, self._anchor_targets["soma"], self._anchor_stds["soma"])
-        z_imp = zdiff(impares, self._anchor_targets["impares"], self._anchor_stds["impares"])
-        z_faixa = zdiff(faixa, self._anchor_targets["faixa_1_13"], self._anchor_stds["faixa_1_13"])
-        z_adj = zdiff(adj, self._anchor_targets["adjacencias"], self._anchor_stds["adjacencias"])
-        z_rep = 0.0  # não avaliamos repetição por enquanto
-
-        dist = (
-            w["soma"] * z_soma
-            + w["impares"] * z_imp
-            + w["faixa_1_13"] * z_faixa
-            + w["adjacencias"] * z_adj
-            + w["repeticao"] * z_rep
-        )
-
-        # score_fractal: 1 - dist, clamp para não explodir
-        score = 1.0 - dist
-        score = max(-2.0, min(1.0, score))
-
-        detalhes = {
-            "ativo": True,
-            "window": self._dna_anchor_window,
-            "pesos_metricas": w,
-            "targets": self._anchor_targets,
-            "stds": self._anchor_stds,
-            "seq_metricas": {
-                "soma": soma,
-                "impares": impares,
-                "faixa_1_13": faixa,
-                "adjacencias": adj,
-                "repeticao": repeticao,
-            },
-            "z_diffs": {
-                "soma": round(z_soma, 6),
-                "impares": round(z_imp, 6),
-                "faixa_1_13": round(z_faixa, 6),
-                "adjacencias": round(z_adj, 6),
-                "repeticao": round(z_rep, 6),
-            },
-            "dist": round(dist, 6),
-            "score_fractal": round(score, 6),
-        }
-        return float(round(score, 6)), detalhes
+        coerente = dist <= (2.0 * sigma)
+        return float(score), bool(coerente)
 
     # ------------------------------------------------------------
-    # Avaliação estrutural (compatível com JSONs anteriores)
+    # Avaliação — compatível com JSONs anteriores, mas com adj melhor
     # ------------------------------------------------------------
 
     def avaliar_sequencia(
@@ -343,7 +212,6 @@ class MotorFGI:
         regime_id: str = "estavel",
         pesos_override: Optional[Dict[str, float]] = None,
         constraints_override: Optional[Dict[str, Any]] = None,
-        pesos_metricas: Optional[Dict[str, float]] = None,
         **_ignored: Any,
     ) -> Prototipo:
         k = int(k)
@@ -352,41 +220,42 @@ class MotorFGI:
 
         # constraints efetivos
         z_max_soma = float(base["z_max_soma"])
-        max_adj = int(base["max_adjacencias"])
+        max_adj_fallback = int(base["max_adjacencias"])
         max_desvio_pares = int(base["max_desvio_pares"])
 
-        # lambda da camada fractal (vem por constraints_override pra não quebrar schema)
-        lambda_fractal = 0.45  # default bom pra começar
         if constraints_override:
             if "z_max_soma" in constraints_override:
                 z_max_soma = float(constraints_override["z_max_soma"])
             if "max_adjacencias" in constraints_override:
-                max_adj = int(constraints_override["max_adjacencias"])
+                max_adj_fallback = int(constraints_override["max_adjacencias"])
             if "max_desvio_pares" in constraints_override:
                 max_desvio_pares = int(constraints_override["max_desvio_pares"])
-            if "lambda_fractal" in constraints_override:
-                lambda_fractal = float(constraints_override["lambda_fractal"])
 
-        # pesos efetivos (estruturais)
+        # pesos efetivos
         pesos = dict(base["pesos"])
         if pesos_override:
             for kk, vv in pesos_override.items():
                 if kk in pesos:
                     pesos[kk] = float(vv)
 
-        seq_sorted = sorted(int(x) for x in seq)
-        soma = int(sum(seq_sorted))
-        pares = sum(1 for x in seq_sorted if x % 2 == 0)
+        seq_int = [int(x) for x in seq]
+        soma = int(sum(seq_int))
+        pares = sum(1 for x in seq_int if x % 2 == 0)
         impares = k - pares
-        adj = self._count_adjacencias(seq_sorted)
+        adj = self._count_adjacencias(seq_int)
 
         mu_soma, sd_soma = self._sum_stats_sem_reposicao(k)
         z_soma = 0.0 if sd_soma == 0 else (soma - mu_soma) / sd_soma
 
-        # ---- componentes (mantém compat com seus outputs)
+        # -------------------
+        # score_soma
+        # -------------------
         excedente = max(0.0, abs(z_soma) - z_max_soma)
-        score_soma = -excedente
+        score_soma = -excedente  # 0 se ok, negativo se estourou
 
+        # -------------------
+        # score_pares
+        # -------------------
         alvo_pares = k / 2.0
         desvio_pares = abs(pares - alvo_pares)
         score_pares = 0.0
@@ -394,34 +263,46 @@ class MotorFGI:
             score_pares = 1.0 - (desvio_pares / float(max_desvio_pares))
             score_pares = max(0.0, min(1.0, score_pares))
 
-        score_adj = 0.0 if adj <= max_adj else -1.0
+        # -------------------
+        # score_adj
+        # - se houver DNA anchor ativo: score contínuo por distância ao alvo
+        # - senão: fallback antigo (0 ou -1)
+        # -------------------
+        score_adj = 0.0
+        adj_coerente = True
 
-        score_estrutural = (
+        if self._dna_anchor_active and self._adj_target is not None and self._adj_sigma is not None:
+            score_adj, adj_coerente = self._score_adj_anchor(adj)
+        else:
+            score_adj = 0.0 if adj <= max_adj_fallback else -1.0
+            adj_coerente = (adj <= max_adj_fallback)
+
+        # -------------------
+        # score_total
+        # -------------------
+        score_total = (
             pesos["soma"] * score_soma
             + pesos["pares"] * score_pares
             + pesos["adj"] * score_adj
         )
 
-        # violações estruturais
+        # -------------------
+        # violações / coerências
+        # -------------------
         viol = 0
-        if abs(z_soma) > z_max_soma:
+
+        soma_ok = abs(z_soma) <= z_max_soma
+        pares_ok = (max_desvio_pares <= 0) or (desvio_pares <= max_desvio_pares)
+
+        if not soma_ok:
             viol += 1
-        if adj > max_adj:
+        if not pares_ok:
             viol += 1
-        if max_desvio_pares > 0 and desvio_pares > max_desvio_pares:
+        if not adj_coerente:
             viol += 1
 
         total_constraints = 3
         coerencias = max(0, total_constraints - viol)
-
-        # camada fractal
-        score_fractal, detalhes_fractal = self._score_fractal(
-            seq_sorted,
-            k=k,
-            pesos_metricas=pesos_metricas,
-        )
-
-        score_total = score_estrutural + (lambda_fractal * score_fractal)
 
         detalhes = {
             "k": k,
@@ -437,23 +318,21 @@ class MotorFGI:
                 "score_soma": round(score_soma, 4),
                 "score_pares": round(score_pares, 4),
                 "score_adj": round(score_adj, 4),
-                "score_estrutural": round(score_estrutural, 6),
-                "score_fractal": round(score_fractal, 6),
-                "lambda_fractal": round(lambda_fractal, 6),
                 "pesos": pesos,
                 "constraints": {
                     "z_max_soma": z_max_soma,
-                    "max_adjacencias": max_adj,
+                    "max_adjacencias": max_adj_fallback,
                     "max_desvio_pares": max_desvio_pares,
-                    "lambda_fractal": lambda_fractal,
+                    "adj_target": self._adj_target,
+                    "adj_sigma": self._adj_sigma,
+                    "adj_window": self._adj_window,
                 },
             },
-            "fractal": detalhes_fractal,
             "dna_anchor": self.get_dna_anchor(),
         }
 
         return Prototipo(
-            sequencia=seq_sorted,
+            sequencia=sorted(seq_int),
             score_total=float(round(score_total, 6)),
             coerencias=int(coerencias),
             violacoes=int(viol),
@@ -484,8 +363,7 @@ class MotorFGI:
 
         contexto_lab = None
         if incluir_contexto_dna and self._dna_anchor_active:
-            # o app injeta contexto no próprio response, então aqui só garantimos compat
-            contexto_lab = {"dna_anchor": self.get_dna_anchor()}
+            contexto_lab = self._dna_anchor
 
         candidatos = self.grupo.get_candidatos(k=k, max_candidatos=max_candidatos)
 
@@ -497,7 +375,6 @@ class MotorFGI:
                 regime_id=regime_id,
                 pesos_override=pesos_override or {},
                 constraints_override=constraints_override or {},
-                pesos_metricas=pesos_metricas or None,
             )
             prototipos.append(p)
 
@@ -525,4 +402,4 @@ class MotorFGI:
                 "pesos_metricas": pesos_metricas or None,
             },
             "contexto_lab": contexto_lab,
-    }
+                    }
