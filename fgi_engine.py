@@ -29,9 +29,10 @@ class MotorFGI:
     """
     Motor de avaliação / geração de protótipos.
 
-    Contrato-resiliente:
-    - aceita overrides novos sem quebrar (via **kwargs e campos opcionais)
-    - expõe set_dna_anchor() com assinatura compatível com o app.py atual
+    Decisão de engenharia:
+    1) Filtro duro (pré-score) para limpar o espaço de busca.
+    2) Contrato-resiliente: não quebra com kwargs novos.
+    3) DNA anchor é guardado e exposto; acoplamento ao score vem depois.
     """
 
     def __init__(
@@ -48,71 +49,63 @@ class MotorFGI:
 
         self.regime_padrao = "estavel"
 
+        # Regras/limites por regime (compatível com seus JSONs)
         self._regimes: Dict[str, Dict[str, Any]] = {
             "estavel": {
                 "z_max_soma": 1.30,
                 "max_adjacencias": 3,
                 "max_desvio_pares": 2,
                 "pesos": {"soma": 1.2, "pares": 0.6, "adj": 0.6},
+                # HARD FILTER default (corta-lixo)
+                "hard_max_adjacencias": 8,
             },
             "tenso": {
                 "z_max_soma": 1.70,
                 "max_adjacencias": 4,
                 "max_desvio_pares": 3,
                 "pesos": {"soma": 1.0, "pares": 0.45, "adj": 0.45},
+                "hard_max_adjacencias": 9,
             },
         }
 
-        # DNA anchor (injetado pelo app quando incluir_contexto_dna=True)
+        # DNA anchor (contexto do laboratório)
         self._dna_anchor: Optional[Dict[str, Any]] = None
         self._dna_anchor_active: bool = False
 
     # ------------------------------------------------------------
-    # Contrato exigido pelo app.py (corrige 500 de atributo/assinatura)
+    # Contrato resiliente (corrige 500 por assinatura)
     # ------------------------------------------------------------
 
-    def set_dna_anchor(
-        self,
-        dna_anchor: Optional[Dict[str, Any]] = None,
-        *,
-        dna_last25: Optional[Dict[str, Any]] = None,
-        window: Optional[int] = None,
-        **_ignored: Any,
-    ) -> None:
+    def set_dna_anchor(self, dna_anchor: Optional[Dict[str, Any]] = None, **kwargs: Any) -> None:
         """
-        Suporta os dois formatos:
-
-        (A) formato novo (do seu app.py):
-            set_dna_anchor(dna_last25=<dict>, window=12)
-
-        (B) formato antigo:
-            set_dna_anchor(dna_anchor=<dict>)
-
-        Qualquer kwargs extra é ignorado (resiliência).
+        Aceita:
+          - set_dna_anchor({...})
+          - set_dna_anchor(dna_last25=..., window=12)
+          - set_dna_anchor(anchor={...})
+        Nunca quebra por kwargs inesperado.
         """
-        if dna_anchor is not None:
+        # Caso 1: veio dict direto
+        if isinstance(dna_anchor, dict):
             payload = dna_anchor
         else:
-            # monta payload "padrão laboratório"
-            payload = {
-                "dna_last25": dna_last25,
-                "window": int(window) if window is not None else None,
-            }
+            payload = None
 
-        # normaliza: se não veio nada útil, desativa
-        if not payload or (isinstance(payload, dict) and all(v is None for v in payload.values())):
-            self._dna_anchor = None
-            self._dna_anchor_active = False
-            return
+        # Caso 2: veio via kwargs em formatos variados
+        if payload is None:
+            if "anchor" in kwargs and isinstance(kwargs["anchor"], dict):
+                payload = kwargs["anchor"]
+            else:
+                # padrão do seu app.py: dna_last25 + window
+                dna_last25 = kwargs.get("dna_last25")
+                window = kwargs.get("window")
+                if dna_last25 is not None or window is not None:
+                    payload = {
+                        "dna_last25": dna_last25,
+                        "window": window,
+                    }
 
-        if not isinstance(payload, dict):
-            # garante que não explode por tipo bizarro vindo do app
-            self._dna_anchor = {"raw": payload}
-            self._dna_anchor_active = True
-            return
-
-        self._dna_anchor = payload
-        self._dna_anchor_active = True
+        self._dna_anchor = payload or None
+        self._dna_anchor_active = bool(self._dna_anchor)
 
     def get_dna_anchor(self) -> Dict[str, Any]:
         return {
@@ -138,10 +131,6 @@ class MotorFGI:
         return mu, sd
 
     def _count_adjacencias(self, seq: List[int]) -> int:
-        """
-        Conta adjacências (pares consecutivos) dentro da sequência.
-        Ex: [1,2,3] tem 2 adjacências (1-2, 2-3).
-        """
         if not seq:
             return 0
         s = sorted(seq)
@@ -152,7 +141,43 @@ class MotorFGI:
         return adj
 
     # ------------------------------------------------------------
-    # Avaliação (score + violações) — compatível com seus JSONs
+    # HARD FILTER (pré-score)
+    # ------------------------------------------------------------
+
+    def _passa_filtro_duro(
+        self,
+        seq: List[int],
+        k: int,
+        regime_id: str,
+        constraints_override: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Filtro determinístico: elimina lixo estrutural antes de gastar score.
+        Default: corta por adjacência extrema.
+
+        Você pode controlar via constraints_override:
+          - hard_max_adjacencias
+        """
+        regime_id = (regime_id or self.regime_padrao).strip().lower()
+        base = self._regimes.get(regime_id, self._regimes[self.regime_padrao])
+
+        hard_max_adj = int(base.get("hard_max_adjacencias", 8))
+        if constraints_override and "hard_max_adjacencias" in constraints_override:
+            hard_max_adj = int(constraints_override["hard_max_adjacencias"])
+
+        adj = self._count_adjacencias(seq)
+
+        motivos = {}
+        if adj > hard_max_adj:
+            motivos["reprovado_por"] = "hard_max_adjacencias"
+            motivos["adjacencias"] = adj
+            motivos["hard_max_adjacencias"] = hard_max_adj
+            return False, motivos
+
+        return True, {"hard_max_adjacencias": hard_max_adj, "adjacencias": adj}
+
+    # ------------------------------------------------------------
+    # Avaliação (score + violações)
     # ------------------------------------------------------------
 
     def avaliar_sequencia(
@@ -166,7 +191,6 @@ class MotorFGI:
     ) -> Prototipo:
         k = int(k)
         regime_id = (regime_id or self.regime_padrao).strip().lower()
-
         base = self._regimes.get(regime_id, self._regimes[self.regime_padrao])
 
         # constraints efetivos
@@ -197,17 +221,15 @@ class MotorFGI:
         mu_soma, sd_soma = self._sum_stats_sem_reposicao(k)
         z_soma = 0.0 if sd_soma == 0 else (soma - mu_soma) / sd_soma
 
-        # componentes
         excedente = max(0.0, abs(z_soma) - z_max_soma)
         score_soma = -excedente
 
         alvo_pares = k / 2.0
         desvio_pares = abs(pares - alvo_pares)
+        score_pares = 0.0
         if max_desvio_pares > 0:
             score_pares = 1.0 - (desvio_pares / float(max_desvio_pares))
             score_pares = max(0.0, min(1.0, score_pares))
-        else:
-            score_pares = 0.0
 
         score_adj = 0.0 if adj <= max_adj else -1.0
 
@@ -217,7 +239,6 @@ class MotorFGI:
             + pesos["adj"] * score_adj
         )
 
-        # violações
         viol = 0
         if abs(z_soma) > z_max_soma:
             viol += 1
@@ -290,7 +311,19 @@ class MotorFGI:
         candidatos = self.grupo.get_candidatos(k=k, max_candidatos=max_candidatos)
 
         prototipos: List[Prototipo] = []
+        reprovados_hard = 0
+
         for seq in candidatos:
+            ok, info = self._passa_filtro_duro(
+                list(seq),
+                k=k,
+                regime_id=regime_id,
+                constraints_override=constraints_override or {},
+            )
+            if not ok:
+                reprovados_hard += 1
+                continue
+
             p = self.avaliar_sequencia(
                 list(seq),
                 k=k,
@@ -324,4 +357,8 @@ class MotorFGI:
                 "pesos_metricas": pesos_metricas or None,
             },
             "contexto_lab": contexto_lab,
-}
+            "debug": {
+                "hard_filter_reprovados": reprovados_hard,
+                "hard_filter_aprovados": len(prototipos),
+            },
+    }
