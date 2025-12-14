@@ -1,128 +1,151 @@
+# grupo_de_milhoes.py
 from __future__ import annotations
 
-import csv
-import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+import csv
+import itertools
+import random
 
 
-@dataclass(frozen=True)
-class _Sorteio:
-    dezenas: Tuple[int, ...]  # sempre ordenado
+def _as_int_list(values: Iterable[str]) -> List[int]:
+    out: List[int] = []
+    for v in values:
+        v = (v or "").strip()
+        if not v:
+            continue
+        try:
+            out.append(int(v))
+        except Exception:
+            continue
+    return out
 
 
+def _norm_seq(seq: Sequence[int]) -> Tuple[int, ...]:
+    return tuple(sorted({int(x) for x in seq if x is not None}))
+
+
+@dataclass
 class GrupoDeMilhoes:
     """
-    Grupo de Milhões = todas as combinações possíveis que AINDA NÃO SAÍRAM.
+    Grupo de Milhões = combinações que AINDA NÃO saíram.
 
-    Nesta versão, a estratégia é:
-    - ler o histórico (se existir)
-    - construir um set das combinaações já sorteadas (como tuplas ordenadas)
-    - gerar candidatos por amostragem aleatória + rejeição (sem enumerar universo inteiro)
+    - Não pré-gera tudo (sob demanda)
+    - get_candidatos() suporta shuffle/seed
     """
+    universo_max: int = 25
+    historico_csv: Optional[Path] = None
+    auto_generate: bool = False
 
-    def __init__(
-        self,
-        universo_max: int = 25,
-        historico_csv: Optional[Path] = None,
-        seed: Optional[int] = None,
-    ) -> None:
-        self.universo_max = int(universo_max)
-        self.historico_csv = historico_csv
-        self._rng = random.Random(seed)
+    _sorteadas_por_k: Dict[int, Set[frozenset[int]]] = field(default_factory=dict, init=False)
 
-        self._sorteados: Set[Tuple[int, ...]] = set()
-        if self.historico_csv:
-            self._sorteados = self._carregar_historico(self.historico_csv)
+    def __post_init__(self) -> None:
+        if self.historico_csv is not None:
+            self._carregar_historico(self.historico_csv)
 
-    # -------------------------
-    # Leitura do histórico
-    # -------------------------
-
-    def _carregar_historico(self, path: Path) -> Set[Tuple[int, ...]]:
+    def _carregar_historico(self, path: Path) -> None:
         if not path.exists():
-            return set()
-
-        sorteados: Set[Tuple[int, ...]] = set()
-
-        def extrair_ints(row: Sequence[str]) -> List[int]:
-            nums: List[int] = []
-            for cell in row:
-                cell = (cell or "").strip()
-                if not cell:
-                    continue
-                try:
-                    v = int(cell)
-                except Exception:
-                    continue
-                if 1 <= v <= self.universo_max:
-                    nums.append(v)
-            return nums
+            raise FileNotFoundError(f"csv não encontrado: {path}")
 
         with path.open("r", encoding="utf-8", newline="") as f:
             reader = csv.reader(f)
+            try:
+                header = next(reader)
+            except StopIteration:
+                return
+
+            header_lower = [(h or "").strip().lower() for h in header]
+
+            dez_idxs: List[int] = []
+            for i, h in enumerate(header_lower):
+                if "dez" in h or h.startswith("d") or h.isdigit() or h.startswith("n"):
+                    dez_idxs.append(i)
+
             for row in reader:
-                nums = extrair_ints(row)
+                if not row or all((c or "").strip() == "" for c in row):
+                    continue
 
-                # Tenta detectar dezenas da Lotofácil:
-                # - se linha tiver >= 15 números válidos, pega os 15 primeiros
-                # - se tiver exatamente 15, ok
-                if len(nums) >= 15:
-                    dezenas = tuple(sorted(nums[:15]))
-                    if len(dezenas) == 15:
-                        sorteados.add(dezenas)
+                nums: List[int] = []
+                if dez_idxs:
+                    for i in dez_idxs:
+                        if i >= len(row):
+                            continue
+                        try:
+                            v = int(str(row[i]).strip())
+                        except Exception:
+                            continue
+                        if 1 <= v <= self.universo_max:
+                            nums.append(v)
+                else:
+                    # fallback: varre tudo
+                    for cell in row:
+                        cell = (cell or "").strip()
+                        if not cell:
+                            continue
+                        try:
+                            v = int(cell)
+                        except Exception:
+                            continue
+                        if 1 <= v <= self.universo_max:
+                            nums.append(v)
 
-        return sorteados
+                seq = _norm_seq(nums)
+                k = len(seq)
+                if k <= 0:
+                    continue
 
-    # -------------------------
-    # API pública (usada pelo MotorFGI)
-    # -------------------------
+                self._sorteadas_por_k.setdefault(k, set()).add(frozenset(seq))
 
-    def ja_sorteada(self, seq: Sequence[int]) -> bool:
-        t = tuple(sorted(int(x) for x in seq))
-        return t in self._sorteados
+    def total_sorteadas(self, k: Optional[int] = None) -> int:
+        if k is None:
+            return sum(len(s) for s in self._sorteadas_por_k.values())
+        return len(self._sorteadas_por_k.get(k, set()))
 
-    def get_candidatos(self, k: int, max_candidatos: int = 2000) -> List[Tuple[int, ...]]:
+    def gerar_combinacoes(self, k: int) -> Iterator[Tuple[int, ...]]:
+        universo = range(1, self.universo_max + 1)
+        return itertools.combinations(universo, k)
+
+    def get_candidatos(
+        self,
+        k: int,
+        max_candidatos: int = 2000,
+        shuffle: bool = True,
+        seed: Optional[int] = 1337,
+    ) -> List[List[int]]:
         """
-        Retorna uma lista de candidatos (tuplas ordenadas) que NÃO estão no histórico.
-
-        Estratégia: amostragem aleatória + rejeição.
-        Isso evita o viés de devolver sempre sequências compactadas (1..10 etc).
+        shuffle=True por padrão, porque ordem lexicográfica gera um viés horroroso de adjacências.
         """
-        k = int(k)
-        max_candidatos = int(max_candidatos)
-
-        if k <= 0 or k > self.universo_max:
-            raise ValueError(f"k inválido: {k}")
+        if not (1 <= k <= self.universo_max):
+            raise ValueError(f"k inválido: {k} (esperado 1..{self.universo_max})")
 
         if max_candidatos <= 0:
             return []
 
-        candidatos: List[Tuple[int, ...]] = []
-        vistos: Set[Tuple[int, ...]] = set()
+        sorteadas = self._sorteadas_por_k.get(k, set())
 
-        # limite de tentativas para evitar loop infinito se o histórico for gigantesco
-        # (na prática, pra Lotofácil isso é tranquilo)
-        max_tentativas = max(50_000, max_candidatos * 200)
+        # determinístico (streaming)
+        if not shuffle:
+            out: List[List[int]] = []
+            for comb in self.gerar_combinacoes(k):
+                if frozenset(comb) in sorteadas:
+                    continue
+                out.append(list(comb))
+                if len(out) >= max_candidatos:
+                    break
+            return out
 
-        universo = list(range(1, self.universo_max + 1))
-
+        # aleatório (amostragem por tentativas)
+        rng = random.Random(seed)
+        out_set: Set[Tuple[int, ...]] = set()
         tentativas = 0
-        while len(candidatos) < max_candidatos and tentativas < max_tentativas:
+        limite_tentativas = max_candidatos * 500
+
+        while len(out_set) < max_candidatos and tentativas < limite_tentativas:
             tentativas += 1
-
-            seq = tuple(sorted(self._rng.sample(universo, k)))
-
-            # evita repetição na própria amostragem
-            if seq in vistos:
+            comb = tuple(sorted(rng.sample(range(1, self.universo_max + 1), k)))
+            if frozenset(comb) in sorteadas:
                 continue
-            vistos.add(seq)
+            out_set.add(comb)
 
-            # exclui o que já saiu
-            if seq in self._sorteados:
-                continue
-
-            candidatos.append(seq)
-
-        return candidatos
+        return [list(t) for t in out_set]
