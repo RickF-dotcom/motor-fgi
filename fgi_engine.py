@@ -1,5 +1,3 @@
-
-# fgi_engine.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -29,13 +27,13 @@ class Prototipo:
 
 class MotorFGI:
     """
-    Motor de avaliação / geração de protótipos (LHE/LHS).
+    Motor de avaliação / geração de protótipos.
 
-    Objetivos desta versão:
-    - NÃO quebrar contrato com app.py / swagger (aceita kwargs extras).
-    - Evolução cirúrgica: ADJACÊNCIAS viram métrica de CONVERGÊNCIA ao DNA(âncora),
-      e não apenas punição genérica.
-    - Manter hard-constraints para impedir sequência degenerada.
+    Objetivos:
+    1) Manter compatibilidade com o payload atual (Swagger/Render)
+    2) Ser resiliente a novos parâmetros (aceita **kwargs)
+    3) Adicionar camada discriminante: score_fractal (DNA anchor)
+       sem quebrar o score estrutural existente.
     """
 
     def __init__(
@@ -52,80 +50,154 @@ class MotorFGI:
 
         self.regime_padrao = "estavel"
 
+        # Regras/limites por regime (compat com JSONs anteriores)
         self._regimes: Dict[str, Dict[str, Any]] = {
             "estavel": {
                 "z_max_soma": 1.30,
+                "max_adjacencias": 3,
                 "max_desvio_pares": 2,
-                "max_adjacencias": 3,          # regra antiga (sem âncora)
-                "hard_max_adjacencias": 13,    # regra dura (com âncora)
-                "adj_tolerancia": 2.5,         # tolerância padrão para convergência ao alvo
                 "pesos": {"soma": 1.2, "pares": 0.6, "adj": 0.6},
             },
             "tenso": {
                 "z_max_soma": 1.70,
-                "max_desvio_pares": 3,
                 "max_adjacencias": 4,
-                "hard_max_adjacencias": 13,
-                "adj_tolerancia": 3.0,
+                "max_desvio_pares": 3,
                 "pesos": {"soma": 1.0, "pares": 0.45, "adj": 0.45},
             },
         }
 
-        # DNA anchor (injetado pelo app)
-        self._dna_anchor: Optional[Dict[str, Any]] = None
+        # DNA anchor (injetado pelo app antes do /prototipos)
         self._dna_anchor_active: bool = False
-        self._dna_anchor_window: Optional[int] = None  # ex.: 12
+        self._dna_anchor_window: Optional[int] = None
+
+        # alvos (médias) para a janela escolhida (ex: DNA(12))
+        self._anchor_targets: Dict[str, float] = {}
+
+        # desvios (std) usados para normalização do score_fractal
+        # (tentamos puxar do baseline do regime_detector; se não vier, usamos fallback)
+        self._anchor_stds: Dict[str, float] = {
+            "soma": 18.25,
+            "impares": 1.37,
+            "faixa_1_13": 1.33,
+            "adjacencias": 2.01,
+            "repeticao": 1.70,
+        }
 
     # ------------------------------------------------------------
-    # Contrato resiliente: set_dna_anchor
+    # Contrato para o app.py (aceita assinaturas diferentes)
     # ------------------------------------------------------------
 
-    def set_dna_anchor(self, dna_anchor: Optional[Dict[str, Any]] = None, **kwargs: Any) -> None:
+    def set_dna_anchor(self, *args: Any, **kwargs: Any) -> None:
         """
-        Formatos aceitos:
-        1) set_dna_anchor(dna_anchor=<dict>)
-        2) set_dna_anchor(dna_last25=<dict>, window=<int>)   (compat com seu app.py)
+        Aceita 2 formatos (sem quebrar):
+
+        1) set_dna_anchor(dna_anchor: dict)  [formato antigo]
+        2) set_dna_anchor(dna_last25=<dict>, window=<int>)  [formato do seu app.py atual]
+
+        O anchor usado aqui é um "alvo" de médias do DNA para uma janela (ex: 12).
         """
-        # Formato 2 (compat):
-        if dna_anchor is None and ("dna_last25" in kwargs or "window" in kwargs):
-            dna_last25 = kwargs.get("dna_last25")
-            window = kwargs.get("window")
+        dna_anchor = None
+        window = None
 
-            if isinstance(window, (int, float, str)):
-                try:
-                    window = int(window)
-                except Exception:
-                    window = None
+        # Formato 1 (posicional)
+        if args and isinstance(args[0], dict):
+            dna_anchor = args[0]
 
-            if isinstance(dna_last25, dict):
-                self._dna_anchor = dna_last25
-                self._dna_anchor_window = window
-                self._dna_anchor_active = True
-                return
+        # Formato 2 (kwargs)
+        if "dna_last25" in kwargs and isinstance(kwargs["dna_last25"], dict):
+            dna_anchor = kwargs["dna_last25"]
+        if "window" in kwargs:
+            try:
+                window = int(kwargs["window"])
+            except Exception:
+                window = None
 
-            self._dna_anchor = None
-            self._dna_anchor_window = None
+        # fallback: se veio "dna_anchor" por kwargs
+        if dna_anchor is None and "dna_anchor" in kwargs and isinstance(kwargs["dna_anchor"], dict):
+            dna_anchor = kwargs["dna_anchor"]
+
+        # Se não veio nada, desativa
+        if not dna_anchor:
             self._dna_anchor_active = False
+            self._dna_anchor_window = None
+            self._anchor_targets = {}
             return
 
-        # Formato 1:
-        self._dna_anchor = dna_anchor if isinstance(dna_anchor, dict) else None
-        self._dna_anchor_active = bool(self._dna_anchor)
+        # Tentamos localizar o dicionário de janelas em formatos possíveis:
+        # - {"janelas": {...}}
+        # - {"dna": {"janelas": {...}}}
+        janelas = None
+        if isinstance(dna_anchor.get("janelas"), dict):
+            janelas = dna_anchor["janelas"]
+        elif isinstance(dna_anchor.get("dna"), dict) and isinstance(dna_anchor["dna"].get("janelas"), dict):
+            janelas = dna_anchor["dna"]["janelas"]
 
-        w = kwargs.get("window", None)
-        if isinstance(w, (int, float, str)):
-            try:
-                self._dna_anchor_window = int(w)
-            except Exception:
-                self._dna_anchor_window = None
-        else:
-            self._dna_anchor_window = None
+        # Se não tem janelas, ativa mas sem targets (não quebra)
+        if not isinstance(janelas, dict):
+            self._dna_anchor_active = True
+            self._dna_anchor_window = window
+            self._anchor_targets = {}
+            return
+
+        # Se window não foi passado, escolhe 12 como padrão (boa âncora)
+        if window is None:
+            window = 12
+
+        win_key = str(window)
+        alvo = janelas.get(win_key)
+
+        # Se não existir exatamente, tenta fallback: 12 -> 10 -> 15 -> 25
+        if not isinstance(alvo, dict):
+            for alt in ("12", "10", "15", "25", "7", "20"):
+                if isinstance(janelas.get(alt), dict):
+                    alvo = janelas[alt]
+                    window = int(alt)
+                    break
+
+        if not isinstance(alvo, dict):
+            self._dna_anchor_active = True
+            self._dna_anchor_window = window
+            self._anchor_targets = {}
+            return
+
+        # Targets (médias) — nomes batendo com seus JSONs
+        # Alguns JSONs usam "adjacencias_media" e outros "adjacencias_media" (sem acento).
+        self._anchor_targets = {
+            "soma": float(alvo.get("soma_media", 0.0) or 0.0),
+            "impares": float(alvo.get("impares_media", 0.0) or 0.0),
+            "faixa_1_13": float(alvo.get("faixa_1_13_media", 0.0) or 0.0),
+            "adjacencias": float(alvo.get("adjacencias_media", 0.0) or 0.0),
+            "repeticao": float(alvo.get("repeticao_media", 0.0) or 0.0),
+        }
+
+        # Se o dna_anchor também trouxer baseline stds (do regime_detector), usamos
+        # Possível formato:
+        # dna_anchor["regime_atual"]["baseline"]["stds"][...]
+        try:
+            reg = dna_anchor.get("regime_atual") or dna_anchor.get("baseline") or {}
+            if isinstance(reg, dict) and isinstance(reg.get("baseline"), dict):
+                b = reg["baseline"]
+            else:
+                b = reg
+            stds = None
+            if isinstance(b, dict) and isinstance(b.get("stds"), dict):
+                stds = b["stds"]
+            if isinstance(stds, dict):
+                for k in self._anchor_stds.keys():
+                    if k in stds and stds[k] is not None:
+                        self._anchor_stds[k] = float(stds[k])
+        except Exception:
+            pass
+
+        self._dna_anchor_active = True
+        self._dna_anchor_window = window
 
     def get_dna_anchor(self) -> Dict[str, Any]:
         return {
             "ativo": self._dna_anchor_active,
             "window": self._dna_anchor_window,
-            "payload": self._dna_anchor if self._dna_anchor_active else None,
+            "targets": self._anchor_targets if self._dna_anchor_active else None,
+            "stds": self._anchor_stds if self._dna_anchor_active else None,
         }
 
     # ------------------------------------------------------------
@@ -155,42 +227,113 @@ class MotorFGI:
                 adj += 1
         return adj
 
-    def _extract_adj_target_from_anchor(self) -> Optional[float]:
-        """
-        Tenta extrair adjacencias_media do DNA(anchor) na janela desejada.
-        Esperado:
-          dna = {"origem": "...", "janelas": {"12": {"adjacencias_media": ...}, ...}}
-        """
-        if not self._dna_anchor_active or not isinstance(self._dna_anchor, dict):
-            return None
-
-        janelas = self._dna_anchor.get("janelas")
-        if not isinstance(janelas, dict) or not janelas:
-            return None
-
-        # janela preferida
-        if isinstance(self._dna_anchor_window, int) and str(self._dna_anchor_window) in janelas:
-            wdata = janelas.get(str(self._dna_anchor_window), {})
-            if isinstance(wdata, dict) and "adjacencias_media" in wdata:
-                try:
-                    return float(wdata["adjacencias_media"])
-                except Exception:
-                    pass
-
-        # fallback: tenta 12, depois 10, depois 25
-        for fallback in ("12", "10", "25"):
-            if fallback in janelas:
-                wdata = janelas.get(fallback, {})
-                if isinstance(wdata, dict) and "adjacencias_media" in wdata:
-                    try:
-                        return float(wdata["adjacencias_media"])
-                    except Exception:
-                        continue
-
-        return None
+    def _count_faixa_1_13(self, seq: List[int]) -> int:
+        return sum(1 for x in seq if 1 <= x <= 13)
 
     # ------------------------------------------------------------
-    # Avaliação (score + violações)
+    # Score fractal (camada discriminante)
+    # ------------------------------------------------------------
+
+    def _score_fractal(
+        self,
+        seq: List[int],
+        k: int,
+        pesos_metricas: Optional[Dict[str, float]] = None,
+    ) -> Tuple[float, Dict[str, Any]]:
+        """
+        Mede "proximidade" da sequência ao DNA-anchor (janela escolhida).
+        Retorna (score_fractal, detalhes_fractal)
+
+        Estratégia:
+        - calcula métricas da seq
+        - calcula z-diffs (diferença / std)
+        - agrega por pesos
+        - score = 1 - dist (clamp)  -> quanto menor a distância, maior o score
+        """
+        if not (self._dna_anchor_active and self._anchor_targets):
+            return 0.0, {
+                "ativo": False,
+                "motivo": "anchor_inativo_ou_sem_targets",
+            }
+
+        seq_sorted = sorted(seq)
+        soma = float(sum(seq_sorted))
+        impares = float(sum(1 for x in seq_sorted if x % 2 != 0))
+        faixa = float(self._count_faixa_1_13(seq_sorted))
+        adj = float(self._count_adjacencias(seq_sorted))
+
+        # repetição: sem acesso ao “último concurso” aqui, não dá pra medir de forma correta.
+        # então não usamos repeticao como distância (peso 0 por padrão).
+        repeticao = 0.0
+
+        # pesos default (foco no que a gente mede bem agora)
+        w = {
+            "soma": 0.40,
+            "impares": 0.25,
+            "faixa_1_13": 0.20,
+            "adjacencias": 0.15,
+            "repeticao": 0.00,
+        }
+        if pesos_metricas:
+            for kk, vv in pesos_metricas.items():
+                if kk in w:
+                    w[kk] = float(vv)
+
+        # normaliza pesos (evita soma != 1)
+        wsum = sum(max(0.0, v) for v in w.values())
+        if wsum <= 0:
+            wsum = 1.0
+        w = {kk: max(0.0, vv) / wsum for kk, vv in w.items()}
+
+        def zdiff(val: float, target: float, std: float) -> float:
+            s = float(std) if std and std > 1e-9 else 1.0
+            return abs(val - float(target)) / s
+
+        z_soma = zdiff(soma, self._anchor_targets["soma"], self._anchor_stds["soma"])
+        z_imp = zdiff(impares, self._anchor_targets["impares"], self._anchor_stds["impares"])
+        z_faixa = zdiff(faixa, self._anchor_targets["faixa_1_13"], self._anchor_stds["faixa_1_13"])
+        z_adj = zdiff(adj, self._anchor_targets["adjacencias"], self._anchor_stds["adjacencias"])
+        z_rep = 0.0  # não avaliamos repetição por enquanto
+
+        dist = (
+            w["soma"] * z_soma
+            + w["impares"] * z_imp
+            + w["faixa_1_13"] * z_faixa
+            + w["adjacencias"] * z_adj
+            + w["repeticao"] * z_rep
+        )
+
+        # score_fractal: 1 - dist, clamp para não explodir
+        score = 1.0 - dist
+        score = max(-2.0, min(1.0, score))
+
+        detalhes = {
+            "ativo": True,
+            "window": self._dna_anchor_window,
+            "pesos_metricas": w,
+            "targets": self._anchor_targets,
+            "stds": self._anchor_stds,
+            "seq_metricas": {
+                "soma": soma,
+                "impares": impares,
+                "faixa_1_13": faixa,
+                "adjacencias": adj,
+                "repeticao": repeticao,
+            },
+            "z_diffs": {
+                "soma": round(z_soma, 6),
+                "impares": round(z_imp, 6),
+                "faixa_1_13": round(z_faixa, 6),
+                "adjacencias": round(z_adj, 6),
+                "repeticao": round(z_rep, 6),
+            },
+            "dist": round(dist, 6),
+            "score_fractal": round(score, 6),
+        }
+        return float(round(score, 6)), detalhes
+
+    # ------------------------------------------------------------
+    # Avaliação estrutural (compatível com JSONs anteriores)
     # ------------------------------------------------------------
 
     def avaliar_sequencia(
@@ -200,50 +343,50 @@ class MotorFGI:
         regime_id: str = "estavel",
         pesos_override: Optional[Dict[str, float]] = None,
         constraints_override: Optional[Dict[str, Any]] = None,
+        pesos_metricas: Optional[Dict[str, float]] = None,
         **_ignored: Any,
     ) -> Prototipo:
         k = int(k)
         regime_id = (regime_id or self.regime_padrao).strip().lower()
         base = self._regimes.get(regime_id, self._regimes[self.regime_padrao])
 
+        # constraints efetivos
         z_max_soma = float(base["z_max_soma"])
+        max_adj = int(base["max_adjacencias"])
         max_desvio_pares = int(base["max_desvio_pares"])
-        max_adj_classico = int(base["max_adjacencias"])
-        hard_max_adj = int(base.get("hard_max_adjacencias", max_adj_classico))
-        adj_tol = float(base.get("adj_tolerancia", 2.5))
 
+        # lambda da camada fractal (vem por constraints_override pra não quebrar schema)
+        lambda_fractal = 0.45  # default bom pra começar
         if constraints_override:
             if "z_max_soma" in constraints_override:
                 z_max_soma = float(constraints_override["z_max_soma"])
+            if "max_adjacencias" in constraints_override:
+                max_adj = int(constraints_override["max_adjacencias"])
             if "max_desvio_pares" in constraints_override:
                 max_desvio_pares = int(constraints_override["max_desvio_pares"])
-            if "max_adjacencias" in constraints_override:
-                max_adj_classico = int(constraints_override["max_adjacencias"])
-            if "hard_max_adjacencias" in constraints_override:
-                hard_max_adj = int(constraints_override["hard_max_adjacencias"])
-            if "adj_tolerancia" in constraints_override:
-                adj_tol = float(constraints_override["adj_tolerancia"])
+            if "lambda_fractal" in constraints_override:
+                lambda_fractal = float(constraints_override["lambda_fractal"])
 
+        # pesos efetivos (estruturais)
         pesos = dict(base["pesos"])
         if pesos_override:
             for kk, vv in pesos_override.items():
                 if kk in pesos:
                     pesos[kk] = float(vv)
 
-        seq = [int(x) for x in seq]
-        soma = int(sum(seq))
-        pares = sum(1 for x in seq if x % 2 == 0)
+        seq_sorted = sorted(int(x) for x in seq)
+        soma = int(sum(seq_sorted))
+        pares = sum(1 for x in seq_sorted if x % 2 == 0)
         impares = k - pares
-        adj = self._count_adjacencias(seq)
+        adj = self._count_adjacencias(seq_sorted)
 
         mu_soma, sd_soma = self._sum_stats_sem_reposicao(k)
         z_soma = 0.0 if sd_soma == 0 else (soma - mu_soma) / sd_soma
 
-        # score_soma: 0 se ok, negativo se exceder
+        # ---- componentes (mantém compat com seus outputs)
         excedente = max(0.0, abs(z_soma) - z_max_soma)
         score_soma = -excedente
 
-        # score_pares: 0..1
         alvo_pares = k / 2.0
         desvio_pares = abs(pares - alvo_pares)
         score_pares = 0.0
@@ -251,38 +394,34 @@ class MotorFGI:
             score_pares = 1.0 - (desvio_pares / float(max_desvio_pares))
             score_pares = max(0.0, min(1.0, score_pares))
 
-        # score_adj: com âncora -> convergir ao alvo do DNA(window); sem âncora -> regra antiga
-        adj_target = self._extract_adj_target_from_anchor()
+        score_adj = 0.0 if adj <= max_adj else -1.0
 
-        if self._dna_anchor_active and adj_target is not None and adj_tol > 0:
-            dist = abs(adj - float(adj_target))
-            score_adj = 1.0 - (dist / float(adj_tol))
-            if score_adj < -1.0:
-                score_adj = -1.0
-            if score_adj > 1.0:
-                score_adj = 1.0
-            violou_adj = adj > min(k - 1, hard_max_adj)
-        else:
-            score_adj = 0.0 if adj <= max_adj_classico else -1.0
-            violou_adj = adj > max_adj_classico
-
-        score_total = (
+        score_estrutural = (
             pesos["soma"] * score_soma
             + pesos["pares"] * score_pares
             + pesos["adj"] * score_adj
         )
 
-        # violações
+        # violações estruturais
         viol = 0
         if abs(z_soma) > z_max_soma:
             viol += 1
-        if violou_adj:
+        if adj > max_adj:
             viol += 1
         if max_desvio_pares > 0 and desvio_pares > max_desvio_pares:
             viol += 1
 
         total_constraints = 3
         coerencias = max(0, total_constraints - viol)
+
+        # camada fractal
+        score_fractal, detalhes_fractal = self._score_fractal(
+            seq_sorted,
+            k=k,
+            pesos_metricas=pesos_metricas,
+        )
+
+        score_total = score_estrutural + (lambda_fractal * score_fractal)
 
         detalhes = {
             "k": k,
@@ -298,21 +437,23 @@ class MotorFGI:
                 "score_soma": round(score_soma, 4),
                 "score_pares": round(score_pares, 4),
                 "score_adj": round(score_adj, 4),
+                "score_estrutural": round(score_estrutural, 6),
+                "score_fractal": round(score_fractal, 6),
+                "lambda_fractal": round(lambda_fractal, 6),
                 "pesos": pesos,
                 "constraints": {
                     "z_max_soma": z_max_soma,
+                    "max_adjacencias": max_adj,
                     "max_desvio_pares": max_desvio_pares,
-                    "max_adjacencias": max_adj_classico,
-                    "hard_max_adjacencias": hard_max_adj,
-                    "adj_target": round(float(adj_target), 4) if adj_target is not None else None,
-                    "adj_tolerancia": adj_tol if (adj_target is not None) else None,
+                    "lambda_fractal": lambda_fractal,
                 },
             },
+            "fractal": detalhes_fractal,
             "dna_anchor": self.get_dna_anchor(),
         }
 
         return Prototipo(
-            sequencia=sorted(seq),
+            sequencia=seq_sorted,
             score_total=float(round(score_total, 6)),
             coerencias=int(coerencias),
             violacoes=int(viol),
@@ -337,23 +478,14 @@ class MotorFGI:
         top_n: int = 30,
         **_ignored: Any,
     ) -> Dict[str, Any]:
-        """
-        Payload compatível com Swagger:
-        - prototipos
-        - regime_usado
-        - max_candidatos_usado
-        - overrides_usados
-        - contexto_lab (quando incluir_contexto_dna=True e âncora ativa)
-
-        windows/pesos_windows/pesos_metricas aceitos (não usados aqui) para não quebrar contrato.
-        """
         k = int(k)
         top_n = int(top_n)
         max_candidatos = int(max_candidatos)
 
         contexto_lab = None
         if incluir_contexto_dna and self._dna_anchor_active:
-            contexto_lab = self._dna_anchor
+            # o app injeta contexto no próprio response, então aqui só garantimos compat
+            contexto_lab = {"dna_anchor": self.get_dna_anchor()}
 
         candidatos = self.grupo.get_candidatos(k=k, max_candidatos=max_candidatos)
 
@@ -365,10 +497,11 @@ class MotorFGI:
                 regime_id=regime_id,
                 pesos_override=pesos_override or {},
                 constraints_override=constraints_override or {},
+                pesos_metricas=pesos_metricas or None,
             )
             prototipos.append(p)
 
-        prototipos.sort(key=lambda x: (x.score_total, -x.violacoes, x.coerencias), reverse=True)
+        prototipos.sort(key=lambda x: x.score_total, reverse=True)
         prototipos = prototipos[: max(1, top_n)]
 
         return {
@@ -390,7 +523,6 @@ class MotorFGI:
                 "windows": windows or None,
                 "pesos_windows": pesos_windows or None,
                 "pesos_metricas": pesos_metricas or None,
-                "top_n": top_n,
             },
             "contexto_lab": contexto_lab,
-        }
+    }
