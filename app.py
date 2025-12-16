@@ -10,7 +10,9 @@ from fgi_engine import MotorFGI              # v1 (Filtro)
 from fgi_engine_v2 import MotorFGI_V2        # v2 (Direcional/SCF)
 from fgi_engine_v3 import MotorFGI_V3        # v3 (Contraste/DCR)
 
-from grupo_de_milhoes import GrupoMilhoes
+# ✅ IMPORT CERTO (seu arquivo define GrupoDeMilhoes)
+from grupo_de_milhoes import GrupoDeMilhoes
+
 from regime_detector import RegimeDetector
 
 
@@ -29,18 +31,13 @@ app = FastAPI(title="ATHENA LABORATORIO PMF")
 
 @app.get("/")
 def root():
-    # Evita 404 na raiz e mata a confusão no celular:
-    # qualquer acesso ao domínio abre o Swagger.
+    # Evita 404 na raiz: domínio abre o Swagger
     return RedirectResponse(url="/docs")
 
 
 @app.get("/health")
 def health():
-    return {
-        "ok": True,
-        "build_commit": BUILD_COMMIT,
-        "service_id": SERVICE_ID
-    }
+    return {"ok": True, "build_commit": BUILD_COMMIT, "service_id": SERVICE_ID}
 
 
 # ==============================
@@ -155,12 +152,6 @@ def _extract_candidates_for_v3(v2_result: Dict[str, Any]) -> List[Dict[str, Any]
         if metricas is None and isinstance(it.get("metricas"), dict):
             metricas = it.get("metricas")
 
-        if metricas is None and isinstance(it.get("detalhes"), dict):
-            raise HTTPException(
-                status_code=500,
-                detail="V3 exige V2 retornando detail.metricas (vetor numérico). Sua saída atual parece schema v1 ('detalhes')."
-            )
-
         if metricas is None:
             raise HTTPException(
                 status_code=500,
@@ -191,6 +182,7 @@ def gerar_prototipos(req: PrototiposRequest):
     if engine not in ("v1", "v2", "v3"):
         raise HTTPException(status_code=400, detail="engine deve ser 'v1', 'v2' ou 'v3'")
 
+    # Contexto do laboratório
     detector = RegimeDetector()
     dna = detector.get_dna_last25()
     regime = detector.detectar_regime()
@@ -203,17 +195,26 @@ def gerar_prototipos(req: PrototiposRequest):
         "service_id": SERVICE_ID
     }
 
-    grupo = GrupoMilhoes()
-    candidatos = grupo.gerar_combinacoes(
-        k=15,
+    # =========================
+    # Grupo de Milhões (AMOSTRAGEM CORRETA)
+    # =========================
+    # Lotofácil padrão
+    k = 15
+
+    grupo = GrupoDeMilhoes()
+    candidatos = grupo.get_candidatos(
+        k=k,
         max_candidatos=req.max_candidatos,
         shuffle=True,
         seed=1337
     )
-    if not candidatos:
-        raise HTTPException(status_code=500, detail="Grupo de Milhões vazio")
 
+    if not candidatos:
+        raise HTTPException(status_code=500, detail="Grupo de Milhões retornou vazio")
+
+    # =========================
     # v1 — FILTRO
+    # =========================
     motor_v1 = MotorFGI()
     filtrados = motor_v1.gerar_prototipos(
         candidatos=candidatos,
@@ -227,9 +228,12 @@ def gerar_prototipos(req: PrototiposRequest):
             "contexto_lab": contexto_lab
         }
 
+    # prepara lista de sequências para o V2
     seqs_filtradas = _extract_seq_list(filtrados)
 
-    # v2 — SCF
+    # =========================
+    # v2 — SCF (re-ranking)
+    # =========================
     overrides_v2: Dict[str, Any] = {
         "top_n": req.top_n,
         "max_candidatos": req.max_candidatos,
@@ -263,7 +267,9 @@ def gerar_prototipos(req: PrototiposRequest):
             resultado_v2["contexto_lab"] = contexto_lab
         return resultado_v2
 
-    # v3 — CONTRASTE
+    # =========================
+    # v3 — CONTRASTE (rank final)
+    # =========================
     candidatos_v3 = _extract_candidates_for_v3(resultado_v2)
 
     motor_v3 = MotorFGI_V3()
