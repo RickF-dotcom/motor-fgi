@@ -1,85 +1,125 @@
+
 # fgi_engine_v2.py
-# Motor v2 (Direcional / SCF)
-# Ranking forte, sem empates crônicos
+# Motor v2 (Direcional / SCF) — INSTRUMENTADO
 
 from __future__ import annotations
-
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Sequence
 import math
 import statistics
 
-# ==============================
-#  Utilidades numéricas
-# ==============================
-
-def _safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        if x is None:
-            return default
-        return float(x)
-    except Exception:
-        return default
+# =========================
+# Utilidades
+# =========================
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 def _sigmoid(x: float) -> float:
-    if x > 0:
-        return 1 / (1 + math.exp(-x))
-    return math.exp(x) / (1 + math.exp(x))
+    return 1.0 / (1.0 + math.exp(-x))
 
-# ==============================
-#  Motor v2 (Direcional / SCF)
-# ==============================
+def _jaccard(a: Sequence[int], b: Sequence[int]) -> float:
+    sa, sb = set(a), set(b)
+    return len(sa & sb) / len(sa | sb)
+
+# =========================
+# Config
+# =========================
 
 @dataclass
 class MotorV2Config:
-    pesos_metricas: Dict[str, float]
-    pesos_janelas: Dict[str, float]
-    dna_anchor_window: int
+    top_n: int
+    redundancy_jaccard_threshold: float
+    redundancy_penalty: float
     align_temperature: float
-    z_cap: float
-    align_factor: float = 1.0
 
-class MotorV2:
-    def __init__(self, cfg: MotorV2Config):
-        self.cfg = cfg
+# =========================
+# Motor
+# =========================
 
-    def _score_direcional(self, metrics: Dict[str, float], dna_last25: Dict[str, Any]) -> float:
-        score = 0.0
-        for metric, w in self.cfg.pesos_metricas.items():
-            if metric not in metrics:
-                continue
-            x = float(metrics.get(metric, 0.0))
-            mean_anchor = dna_last25.get('mean', 0)
-            std_anchor = dna_last25.get('std', 1)
-            delta = x - mean_anchor
-            t = (x - mean_anchor) / std_anchor if std_anchor != 0 else 0
-            score += w * t
-        return _clamp(score, 0.0, 1.0)
+class MotorFGI_V2:
+    SCHEMA_VERSION = "v2.1"
+    SCORING_MODE = "scf_governing"
 
-    def _score_consistencia(self, zs: Dict[str, float], dna_last25: Dict[str, Any], cfg: MotorV2Config) -> float:
-        zs = {key: zs.get(key, 0.0) for key in zs}
-        ws = []
-        for z in zs:
-            ws.append(self.cfg.pesos_janelas.get(z, 0.0))
-        ws_sum = sum(ws) if ws else 1.0
-        var = sum((z - z_mean) ** 2 for z, z_mean in zip(zs, ws)) / ws_sum
-        consist = _clamp(var, 0.0, 1.0)
-        return consist
+    def rerank(
+        self,
+        candidatos: List[Sequence[int]],
+        contexto_lab: Dict[str, Any],
+        overrides: Dict[str, Any]
+    ) -> Dict[str, Any]:
 
-    def _score_final(self, metrics: Dict[str, float], dna_last25: Dict[str, Any]) -> float:
-        score = 0.0
-        score_direcional = self._score_direcional(metrics, dna_last25)
-        score_consistencia = self._score_consistencia(metrics, dna_last25, self.cfg)
-        score = (score_direcional * 0.7) + (score_consistencia * 0.3)
-        return _clamp(score, 0.0, 1.0)
+        cfg = MotorV2Config(
+            top_n=overrides.get("top_n", 30),
+            redundancy_jaccard_threshold=overrides.get("redundancy_jaccard_threshold", 0.75),
+            redundancy_penalty=overrides.get("redundancy_penalty", 0.50),
+            align_temperature=overrides.get("align_temperature", 2.0),
+        )
 
-# ==============================
-#  Implementação e execução
-# ==============================
+        scored = []
 
-def run_motor_v2(metrics: Dict[str, float], dna_last25: Dict[str, Any], config: MotorV2Config) -> float:
-    motor = MotorV2(config)
-    return motor._score_final(metrics, dna_last25)
+        for seq in candidatos:
+            seq = sorted(seq)
+
+            # ---------- componentes base ----------
+            soma = sum(seq)
+            pares = sum(1 for x in seq if x % 2 == 0)
+            adj = sum(1 for i in range(1, len(seq)) if seq[i] - seq[i-1] == 1)
+
+            # ---------- SCF (sem clamp intermediário) ----------
+            score_direcional = _sigmoid(cfg.align_temperature * (soma - 195) / 15)
+            score_consistencia = 1.0 - abs(adj - 3) / 5
+            score_ancora = _sigmoid((pares - 7) / 2)
+
+            raw_components = {
+                "direcional": score_direcional,
+                "consistencia": score_consistencia,
+                "ancora": score_ancora,
+            }
+
+            weighted_components = {
+                "direcional": 0.4 * score_direcional,
+                "consistencia": 0.35 * score_consistencia,
+                "ancora": 0.25 * score_ancora,
+            }
+
+            score_before_redundancy = sum(weighted_components.values())
+
+            scored.append({
+                "sequencia": seq,
+                "score_raw_components": raw_components,
+                "score_weighted_components": weighted_components,
+                "score_before_redundancy": score_before_redundancy,
+                "score_final": score_before_redundancy,
+                "redundancy_penalty": 0.0
+            })
+
+        # ---------- ordena ----------
+        scored.sort(key=lambda x: x["score_final"], reverse=True)
+
+        # ---------- anti-clone ----------
+        final = []
+        selected = []
+
+        for item in scored:
+            if len(final) >= cfg.top_n:
+                break
+
+            sim = max((_jaccard(item["sequencia"], s) for s in selected), default=0.0)
+            if sim >= cfg.redundancy_jaccard_threshold:
+                penalty = cfg.redundancy_penalty * (
+                    (sim - cfg.redundancy_jaccard_threshold) /
+                    (1.0 - cfg.redundancy_jaccard_threshold)
+                )
+                penalty = _clamp(penalty, 0.0, 0.9)
+                item["redundancy_penalty"] = penalty
+                item["score_final"] *= (1.0 - penalty)
+
+            final.append(item)
+            selected.append(item["sequencia"])
+
+        return {
+            "engine_used": "v2",
+            "schema_version": self.SCHEMA_VERSION,
+            "scoring_mode": self.SCORING_MODE,
+            "top": final
+                }
