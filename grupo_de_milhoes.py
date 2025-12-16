@@ -28,7 +28,7 @@ def _norm_seq(seq: Sequence[int]) -> Tuple[int, ...]:
 
 
 @dataclass
-class GrupoDeMilhoes:
+class GrupoMilhoes:
     """
     Grupo de Milhões = combinações que AINDA NÃO saíram.
 
