@@ -1,3 +1,4 @@
+
 # grupo_de_milhoes.py
 from __future__ import annotations
 
@@ -149,3 +150,31 @@ class GrupoDeMilhoes:
             out_set.add(comb)
 
         return [list(t) for t in out_set]
+
+
+# ============================================================
+# Compatibilidade com o app.py atual (não quebrar pipeline)
+# ============================================================
+
+class GrupoMilhoes(GrupoDeMilhoes):
+    """
+    Alias compatível com imports existentes:
+      from grupo_de_milhoes import GrupoMilhoes
+
+    Além disso, implementa gerar_combinacoes() no formato que o app.py usa:
+      candidatos = grupo.gerar_combinacoes()
+      -> retorna List[List[int]]
+    """
+    def gerar_combinacoes(
+        self,
+        k: int = 15,
+        max_candidatos: int = 3000,
+        shuffle: bool = True,
+        seed: Optional[int] = 1337,
+    ) -> List[List[int]]:
+        return self.get_candidatos(
+            k=k,
+            max_candidatos=max_candidatos,
+            shuffle=shuffle,
+            seed=seed,
+        )
