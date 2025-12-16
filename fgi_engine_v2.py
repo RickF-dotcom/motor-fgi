@@ -1,11 +1,7 @@
 
 # fgi_engine_v2.py
 # Motor v2 (Direcional / SCF)
-# - Re-ranqueia candidatos (vindos do Grupo de Milhões / Motor v1) com:
-#   1) alinhamento direcional (tendência do regime nas janelas)
-#   2) consistência multi-janela
-#   3) penalização de redundância (anti-clone)
-#   4) âncora temporal (DNA-13 ou DNA-14, com 25 como contexto)
+# Ranking forte, sem empates crônicos
 
 from __future__ import annotations
 
@@ -33,7 +29,6 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 
 
 def _sigmoid(x: float) -> float:
-    # sigmoid estável
     if x >= 0:
         z = math.exp(-x)
         return 1.0 / (1.0 + z)
@@ -42,30 +37,24 @@ def _sigmoid(x: float) -> float:
 
 
 def _linear_slope(xs: List[float], ys: List[float]) -> float:
-    """
-    Regressão linear simples: slope = cov(x,y)/var(x)
-    """
     if len(xs) != len(ys) or len(xs) < 2:
         return 0.0
     xbar = statistics.mean(xs)
     ybar = statistics.mean(ys)
     num = sum((x - xbar) * (y - ybar) for x, y in zip(xs, ys))
     den = sum((x - xbar) ** 2 for x in xs)
-    if den == 0:
-        return 0.0
-    return num / den
+    return num / den if den != 0 else 0.0
 
 
 def _jaccard(a: Sequence[int], b: Sequence[int]) -> float:
-    sa = set(a)
-    sb = set(b)
+    sa, sb = set(a), set(b)
     inter = len(sa & sb)
     uni = len(sa | sb)
-    return (inter / uni) if uni else 0.0
+    return inter / uni if uni else 0.0
 
 
 # =========================
-#   Extração DNA (robusta)
+#   DNA helpers
 # =========================
 
 def _dig(d: Any, path: List[str]) -> Any:
@@ -77,438 +66,228 @@ def _dig(d: Any, path: List[str]) -> Any:
     return cur
 
 
-def _dna_get_stats(dna_last25: Dict[str, Any], window: int, metric: str) -> Tuple[float, float]:
-    """
-    Tenta extrair (media, desvio) do DNA, tolerando formatos comuns.
-    Se não achar, retorna (0, 1).
-    Formatos aceitos (exemplos):
-      dna["janelas"]["13"]["soma"]["media"]
-      dna["13"]["soma"]["media"]
-      dna["dna_last25"]["13"]["soma"]["media"]
-    """
+def _dna_get_stats(dna: Dict[str, Any], window: int, metric: str) -> Tuple[float, float]:
     w = str(window)
 
-    base = _dig(dna_last25, ["janelas", w, metric])
-    if isinstance(base, dict):
-        mean = _safe_float(base.get("media", base.get("mean", base.get("avg", 0.0))), 0.0)
-        std = _safe_float(base.get("desvio", base.get("std", base.get("sigma", 1.0))), 1.0)
-        return mean, (std if std != 0 else 1.0)
-
-    base = _dig(dna_last25, [w, metric])
-    if isinstance(base, dict):
-        mean = _safe_float(base.get("media", base.get("mean", base.get("avg", 0.0))), 0.0)
-        std = _safe_float(base.get("desvio", base.get("std", base.get("sigma", 1.0))), 1.0)
-        return mean, (std if std != 0 else 1.0)
-
-    base = _dig(dna_last25, ["dna_last25", w, metric])
-    if isinstance(base, dict):
-        mean = _safe_float(base.get("media", base.get("mean", base.get("avg", 0.0))), 0.0)
-        std = _safe_float(base.get("desvio", base.get("std", base.get("sigma", 1.0))), 1.0)
-        return mean, (std if std != 0 else 1.0)
+    for path in (
+        ["janelas", w, metric],
+        [w, metric],
+        ["dna_last25", w, metric],
+    ):
+        base = _dig(dna, path)
+        if isinstance(base, dict):
+            mean = _safe_float(base.get("media", base.get("mean", 0.0)))
+            std = _safe_float(base.get("desvio", base.get("std", 1.0)))
+            return mean, (std if std != 0 else 1.0)
 
     return 0.0, 1.0
 
 
 # =========================
-#   Métricas da sequência
+#   Métricas
 # =========================
 
-def _metric_soma(seq: Sequence[int]) -> int:
-    return int(sum(seq))
-
-
-def _metric_pares(seq: Sequence[int]) -> int:
-    return int(sum(1 for x in seq if x % 2 == 0))
-
-
-def _metric_adjacencias(seq: Sequence[int]) -> int:
+def _metric_soma(seq): return sum(seq)
+def _metric_pares(seq): return sum(1 for x in seq if x % 2 == 0)
+def _metric_adj(seq):
     s = sorted(seq)
-    adj = 0
-    for i in range(1, len(s)):
-        if s[i] - s[i - 1] == 1:
-            adj += 1
-    return adj
-
-
-def _metric_faixa_1_13(seq: Sequence[int]) -> int:
-    return int(sum(1 for x in seq if 1 <= x <= 13))
-
-
-def _metric_repeticao(seq: Sequence[int], ref: Optional[Sequence[int]]) -> int:
-    if not ref:
-        return 0
-    return int(len(set(seq) & set(ref)))
+    return sum(1 for i in range(1, len(s)) if s[i] - s[i-1] == 1)
+def _metric_faixa_1_13(seq): return sum(1 for x in seq if 1 <= x <= 13)
+def _metric_repeticao(seq, ref): return len(set(seq) & set(ref)) if ref else 0
 
 
 # =========================
-#   Config / Resultado
+#   Config
 # =========================
 
 @dataclass
 class MotorV2Config:
-    windows: List[int] = None
-    dna_anchor_window: int = 13
-    top_n: int = 30
-    max_candidatos: int = 3000
-
-    # Pesos por janela (consistência e zscores)
-    pesos_windows: Dict[str, float] = None
-
-    # Pesos por métrica
-    pesos_metricas: Dict[str, float] = None
-
-    # Anti-clone
-    redundancy_jaccard_threshold: float = 0.80
-    redundancy_penalty: float = 0.35  # multiplicativo no greedy
-
-    # Guard rails
-    z_cap: float = 3.5
-    align_temperature: float = 1.25
-
-
-@dataclass
-class MotorV2ScoreDetail:
-    scf_total: float
-    direcional: float
-    consistencia: float
-    ancora: float
-    redundancia_penalidade: float
-    metricas: Dict[str, float]
-    zscores: Dict[str, Dict[str, float]]  # metric -> window(str) -> z(float)
+    windows: List[int]
+    dna_anchor_window: int
+    top_n: int
+    max_candidatos: int
+    pesos_windows: Dict[str, float]
+    pesos_metricas: Dict[str, float]
+    redundancy_jaccard_threshold: float
+    redundancy_penalty: float
+    z_cap: float
+    align_temperature: float
 
 
 # =========================
-#   Motor v2 (SCF)
+#   Motor v2
 # =========================
 
 class MotorFGI_V2:
-    METRICAS_SUPORTADAS = ("soma", "pares", "adj", "faixa_1_13", "repeticao")
+    METRICAS = ("soma", "pares", "adj", "faixa_1_13", "repeticao")
 
-    def __init__(self, config: Optional[MotorV2Config] = None):
-        self.base_cfg = config or self._default_cfg()
-        self.base_cfg = self._normalize_cfg(self.base_cfg)
-
-    def _default_cfg(self) -> MotorV2Config:
-        cfg = MotorV2Config()
-        cfg.windows = [7, 10, 13, 25]
-        cfg.pesos_windows = {"7": 0.15, "10": 0.25, "13": 0.35, "25": 0.25}
-        cfg.pesos_metricas = {"soma": 0.25, "pares": 0.15, "adj": 0.25, "faixa_1_13": 0.20, "repeticao": 0.15}
-        return cfg
-
-    def _normalize_cfg(self, cfg: MotorV2Config) -> MotorV2Config:
-        # defaults defensivos
-        if cfg.windows is None:
-            cfg.windows = [7, 10, 13, 25]
-        if cfg.pesos_windows is None:
-            cfg.pesos_windows = {str(w): 1.0 / len(cfg.windows) for w in cfg.windows}
-        if cfg.pesos_metricas is None:
-            cfg.pesos_metricas = {m: 1.0 / len(self.METRICAS_SUPORTADAS) for m in self.METRICAS_SUPORTADAS}
-
-        # normaliza pesos de janela
-        sw = sum(max(0.0, _safe_float(v)) for v in cfg.pesos_windows.values())
-        if sw <= 0:
-            cfg.pesos_windows = {str(w): 1.0 / len(cfg.windows) for w in cfg.windows}
-        else:
-            cfg.pesos_windows = {str(k): max(0.0, _safe_float(v)) / sw for k, v in cfg.pesos_windows.items()}
-
-        # normaliza pesos de métrica
-        sm = sum(max(0.0, _safe_float(v)) for v in cfg.pesos_metricas.values())
-        if sm <= 0:
-            cfg.pesos_metricas = {m: 1.0 / len(self.METRICAS_SUPORTADAS) for m in self.METRICAS_SUPORTADAS}
-        else:
-            cfg.pesos_metricas = {str(k): max(0.0, _safe_float(v)) / sm for k, v in cfg.pesos_metricas.items()}
-
-        return cfg
-
-    def _apply_overrides(self, overrides: Dict[str, Any]) -> MotorV2Config:
-        base = self.base_cfg
-        cfg = MotorV2Config(
-            windows=list(base.windows),
-            dna_anchor_window=int(base.dna_anchor_window),
-            top_n=int(base.top_n),
-            max_candidatos=int(base.max_candidatos),
-            pesos_windows=dict(base.pesos_windows),
-            pesos_metricas=dict(base.pesos_metricas),
-            redundancy_jaccard_threshold=float(base.redundancy_jaccard_threshold),
-            redundancy_penalty=float(base.redundancy_penalty),
-            z_cap=float(base.z_cap),
-            align_temperature=float(base.align_temperature),
+    def __init__(self):
+        self.base_cfg = MotorV2Config(
+            windows=[7, 10, 13, 25],
+            dna_anchor_window=13,
+            top_n=30,
+            max_candidatos=3000,
+            pesos_windows={"7": 0.15, "10": 0.25, "13": 0.35, "25": 0.25},
+            pesos_metricas={"soma": 0.25, "pares": 0.15, "adj": 0.25, "faixa_1_13": 0.20, "repeticao": 0.15},
+            redundancy_jaccard_threshold=0.80,
+            redundancy_penalty=0.35,
+            z_cap=3.5,
+            align_temperature=1.25,
         )
 
-        if isinstance(overrides.get("windows"), list) and overrides["windows"]:
-            cfg.windows = [int(x) for x in overrides["windows"]]
-
-        if "dna_anchor_window" in overrides:
-            cfg.dna_anchor_window = int(overrides["dna_anchor_window"])
-        if "top_n" in overrides:
-            cfg.top_n = int(overrides["top_n"])
-        if "max_candidatos" in overrides:
-            cfg.max_candidatos = int(overrides["max_candidatos"])
-
-        if isinstance(overrides.get("pesos_windows"), dict):
-            cfg.pesos_windows = {str(k): float(v) for k, v in overrides["pesos_windows"].items()}
-        if isinstance(overrides.get("pesos_metricas"), dict):
-            cfg.pesos_metricas = {str(k): float(v) for k, v in overrides["pesos_metricas"].items()}
-
-        if "redundancy_jaccard_threshold" in overrides:
-            cfg.redundancy_jaccard_threshold = float(overrides["redundancy_jaccard_threshold"])
-        if "redundancy_penalty" in overrides:
-            cfg.redundancy_penalty = float(overrides["redundancy_penalty"])
-        if "z_cap" in overrides:
-            cfg.z_cap = float(overrides["z_cap"])
-        if "align_temperature" in overrides:
-            cfg.align_temperature = float(overrides["align_temperature"])
-
-        return self._normalize_cfg(cfg)
-
-    def _cfg_to_dict(self, cfg: MotorV2Config) -> Dict[str, Any]:
-        return {
-            "windows": list(cfg.windows),
-            "dna_anchor_window": int(cfg.dna_anchor_window),
-            "top_n": int(cfg.top_n),
-            "max_candidatos": int(cfg.max_candidatos),
-            "pesos_windows": dict(cfg.pesos_windows),
-            "pesos_metricas": dict(cfg.pesos_metricas),
-            "redundancy_jaccard_threshold": float(cfg.redundancy_jaccard_threshold),
-            "redundancy_penalty": float(cfg.redundancy_penalty),
-            "z_cap": float(cfg.z_cap),
-            "align_temperature": float(cfg.align_temperature),
-        }
-
-    # -------------------------
-    # API principal
-    # -------------------------
+    # =========================
+    #   API principal
+    # =========================
 
     def rerank(
         self,
         candidatos: List[Sequence[int]],
-        contexto_lab: Optional[Dict[str, Any]] = None,
-        overrides: Optional[Dict[str, Any]] = None,
+        contexto_lab: Dict[str, Any],
+        overrides: Dict[str, Any] = None,
     ) -> Dict[str, Any]:
-        """
-        Retorna dict pronto pra endpoint:
-          {
-            "engine": "v2",
-            "config_usada": {...},
-            "top": [ { "sequencia": [...], "score": ..., "detail": {...} }, ... ],
-            "debug": {...}
-          }
-        """
-        contexto_lab = contexto_lab or {}
-        cfg = self._apply_overrides(overrides or {})
 
-        # disciplina operacional: corta entrada
-        cand = candidatos[: max(0, int(cfg.max_candidatos))]
+        overrides = overrides or {}
+        cfg = self._apply_overrides(overrides)
+        dna = contexto_lab.get("dna_last25", {})
+        last_draw = contexto_lab.get("ultimo_concurso")
 
-        dna_last25 = contexto_lab.get("dna_last25") or contexto_lab.get("dna") or {}
-        last_draw = (
-            contexto_lab.get("last_draw")
-            or contexto_lab.get("ultimo_concurso")
-            or contexto_lab.get("last_result")
-            or None
-        )
+        candidatos = candidatos[:cfg.max_candidatos]
 
-        trend = self._compute_trend_vector(dna_last25, cfg.windows)
+        trend = self._trend_vector(dna, cfg.windows)
+        scored = []
 
-        scored: List[Tuple[float, List[int], MotorV2ScoreDetail]] = []
-        for seq in cand:
-            s = sorted(int(x) for x in seq)
-            metricas = self._compute_metrics(s, last_draw)
-            zscores = self._compute_zscores(metricas, dna_last25, cfg)
+        for seq in candidatos:
+            s = sorted(seq)
+            metrics = self._metrics(s, last_draw)
+            zscores = self._zscores(metrics, dna, cfg)
 
-            direcional = self._score_direcional(metricas, dna_last25, trend, cfg)
+            direcional = self._score_direcional(metrics, dna, trend, cfg)
             consistencia = self._score_consistencia(zscores, cfg)
-            ancora = self._score_ancora(metricas, dna_last25, cfg)
+            ancora = self._score_ancora(metrics, dna, cfg)
 
-            scf_total = (0.45 * direcional) + (0.35 * consistencia) + (0.20 * ancora)
-
-            detail = MotorV2ScoreDetail(
-                scf_total=float(scf_total),
-                direcional=float(direcional),
-                consistencia=float(consistencia),
-                ancora=float(ancora),
-                redundancia_penalidade=0.0,
-                metricas={k: float(v) for k, v in metricas.items()},
-                zscores={m: {str(w): float(z) for w, z in zscores[m].items()} for m in zscores},
+            # ========= SCORE FINAL (SCF MANDA) =========
+            score_final = (
+                0.35 * direcional +
+                0.30 * consistencia +
+                0.20 * ancora
             )
-            scored.append((float(scf_total), s, detail))
+
+            scored.append((score_final, s, {
+                "scf_total": score_final,
+                "direcional": direcional,
+                "consistencia": consistencia,
+                "ancora": ancora,
+                "zscores": zscores,
+                "metricas": metrics,
+                "redundancia_penalidade": 0.0
+            }))
 
         scored.sort(key=lambda x: x[0], reverse=True)
 
-        # greedy anti-clone
-        top: List[Dict[str, Any]] = []
-        selected: List[List[int]] = []
+        # ========= ANTI-CLONE =========
+        top = []
+        selected = []
 
-        for base_score, seq, detail in scored:
-            if len(top) >= int(cfg.top_n):
+        for score, seq, detail in scored:
+            if len(top) >= cfg.top_n:
                 break
 
-            max_sim = 0.0
-            for s2 in selected:
-                sim = _jaccard(seq, s2)
-                if sim > max_sim:
-                    max_sim = sim
-
-            penal = 0.0
-            final_score = base_score
-            if selected and max_sim >= cfg.redundancy_jaccard_threshold:
+            max_sim = max((_jaccard(seq, s2) for s2 in selected), default=0.0)
+            if max_sim >= cfg.redundancy_jaccard_threshold:
                 penal = cfg.redundancy_penalty * (
-                    (max_sim - cfg.redundancy_jaccard_threshold)
-                    / max(1e-9, (1.0 - cfg.redundancy_jaccard_threshold))
+                    (max_sim - cfg.redundancy_jaccard_threshold) /
+                    (1.0 - cfg.redundancy_jaccard_threshold)
                 )
                 penal = _clamp(penal, 0.0, 0.85)
-                final_score = base_score * (1.0 - penal)
+                score *= (1.0 - penal)
+                detail["redundancia_penalidade"] = penal
+                if penal > 0.6:
+                    continue
 
-            detail.redundancia_penalidade = float(penal)
-
-            # gate: corta clones agressivos
-            if penal > 0.60:
-                continue
-
-            top.append(
-                {
-                    "sequencia": seq,
-                    "score": float(final_score),
-                    "detail": {
-                        "scf_total": float(detail.scf_total),
-                        "direcional": float(detail.direcional),
-                        "consistencia": float(detail.consistencia),
-                        "ancora": float(detail.ancora),
-                        "redundancia_penalidade": float(detail.redundancia_penalidade),
-                        "metricas": detail.metricas,
-                        "zscores": detail.zscores,
-                    },
-                }
-            )
+            top.append({
+                "sequencia": seq,
+                "score": score,
+                "detail": detail
+            })
             selected.append(seq)
 
         return {
             "engine": "v2",
-            "config_usada": self._cfg_to_dict(cfg),
+            "config_usada": cfg.__dict__,
             "top": top,
             "debug": {
-                "trend_vector": {k: float(v) for k, v in trend.items()},
-                "candidatos_recebidos": len(candidatos),
-                "candidatos_processados": len(cand),
-                "top_retornado": len(top),
-            },
+                "trend_vector": trend,
+                "candidatos_processados": len(candidatos)
+            }
         }
 
-    # -------------------------
-    # Métricas / zscores / trend
-    # -------------------------
+    # =========================
+    #   Internos
+    # =========================
 
-    def _compute_metrics(self, seq: List[int], last_draw: Optional[Sequence[int]]) -> Dict[str, float]:
+    def _apply_overrides(self, o):
+        cfg = self.base_cfg
+        return MotorV2Config(
+            windows=o.get("windows", cfg.windows),
+            dna_anchor_window=o.get("dna_anchor_window", cfg.dna_anchor_window),
+            top_n=o.get("top_n", cfg.top_n),
+            max_candidatos=o.get("max_candidatos", cfg.max_candidatos),
+            pesos_windows=o.get("pesos_windows", cfg.pesos_windows),
+            pesos_metricas=o.get("pesos_metricas", cfg.pesos_metricas),
+            redundancy_jaccard_threshold=o.get("redundancy_jaccard_threshold", cfg.redundancy_jaccard_threshold),
+            redundancy_penalty=o.get("redundancy_penalty", cfg.redundancy_penalty),
+            z_cap=o.get("z_cap", cfg.z_cap),
+            align_temperature=o.get("align_temperature", cfg.align_temperature),
+        )
+
+    def _metrics(self, seq, last_draw):
         return {
-            "soma": float(_metric_soma(seq)),
-            "pares": float(_metric_pares(seq)),
-            "adj": float(_metric_adjacencias(seq)),
-            "faixa_1_13": float(_metric_faixa_1_13(seq)),
-            "repeticao": float(_metric_repeticao(seq, last_draw)),
+            "soma": _metric_soma(seq),
+            "pares": _metric_pares(seq),
+            "adj": _metric_adj(seq),
+            "faixa_1_13": _metric_faixa_1_13(seq),
+            "repeticao": _metric_repeticao(seq, last_draw),
         }
 
-    def _compute_zscores(
-        self,
-        metricas: Dict[str, float],
-        dna_last25: Dict[str, Any],
-        cfg: MotorV2Config,
-    ) -> Dict[str, Dict[int, float]]:
-        out: Dict[str, Dict[int, float]] = {}
-        for metric in self.METRICAS_SUPORTADAS:
-            out[metric] = {}
-            x = float(metricas.get(metric, 0.0))
+    def _zscores(self, metrics, dna, cfg):
+        out = {}
+        for m in self.METRICAS:
+            out[m] = {}
             for w in cfg.windows:
-                mean, std = _dna_get_stats(dna_last25, w, metric)
-                std = std if std != 0 else 1.0
-                z = (x - mean) / std
-                z = _clamp(z, -cfg.z_cap, cfg.z_cap)
-                out[metric][w] = float(z)
+                mean, std = _dna_get_stats(dna, w, m)
+                z = (metrics[m] - mean) / std
+                out[m][w] = _clamp(z, -cfg.z_cap, cfg.z_cap)
         return out
 
-    def _compute_trend_vector(self, dna_last25: Dict[str, Any], windows: List[int]) -> Dict[str, float]:
+    def _trend_vector(self, dna, windows):
         xs = [float(w) for w in windows]
-        trend: Dict[str, float] = {}
-        for metric in self.METRICAS_SUPORTADAS:
-            ys: List[float] = []
-            for w in windows:
-                mean, _std = _dna_get_stats(dna_last25, w, metric)
-                ys.append(float(mean))
-            trend[metric] = float(_linear_slope(xs, ys))
-        return trend
+        return {
+            m: _linear_slope(xs, [_dna_get_stats(dna, w, m)[0] for w in windows])
+            for m in self.METRICAS
+        }
 
-    # -------------------------
-    # SCF: direcional / consistência / âncora
-    # -------------------------
-
-    def _score_direcional(
-        self,
-        metricas: Dict[str, float],
-        dna_last25: Dict[str, Any],
-        trend: Dict[str, float],
-        cfg: MotorV2Config,
-    ) -> float:
+    def _score_direcional(self, metrics, dna, trend, cfg):
         score = 0.0
-        for metric, w_m in cfg.pesos_metricas.items():
-            if metric not in self.METRICAS_SUPORTADAS:
-                continue
+        for m, w in cfg.pesos_metricas.items():
+            mean, std = _dna_get_stats(dna, cfg.dna_anchor_window, m)
+            delta = (metrics[m] - mean) / std
+            t = trend[m]
+            align = 0.5 if abs(t) < 1e-9 else _sigmoid(cfg.align_temperature * (delta if t > 0 else -delta))
+            score += w * align
+        return score
 
-            x = float(metricas.get(metric, 0.0))
-            mean_anchor, std_anchor = _dna_get_stats(dna_last25, cfg.dna_anchor_window, metric)
-            std_anchor = std_anchor if std_anchor != 0 else 1.0
-            delta = (x - mean_anchor) / std_anchor
+    def _score_consistencia(self, zscores, cfg):
+        score = 0.0
+        for m, w in cfg.pesos_metricas.items():
+            zs = [zscores[m][w_] for w_ in cfg.windows]
+            std = statistics.pstdev(zs) if len(zs) > 1 else 0.0
+            score += w * (1.0 - _clamp(std / 2.0, 0.0, 1.0))
+        return score
 
-            t = float(trend.get(metric, 0.0))
-            if abs(t) < 1e-12:
-                align = 0.5
-            else:
-                desired = 1.0 if t > 0 else -1.0
-                raw = desired * delta
-                align = _sigmoid(cfg.align_temperature * raw)
-
-            score += float(w_m) * float(align)
-
-        return float(_clamp(score, 0.0, 1.0))
-
-    def _score_consistencia(self, zscores: Dict[str, Dict[int, float]], cfg: MotorV2Config) -> float:
-        parts: List[float] = []
-        for metric, w_m in cfg.pesos_metricas.items():
-            if metric not in zscores:
-                continue
-
-            zs: List[float] = []
-            ws: List[float] = []
-            for w in cfg.windows:
-                zs.append(float(zscores[metric].get(w, 0.0)))
-                ws.append(float(cfg.pesos_windows.get(str(w), 0.0)))
-
-            wsum = sum(ws) if sum(ws) > 0 else 1.0
-            zbar = sum(z * w for z, w in zip(zs, ws)) / wsum
-            var = sum(w * (z - zbar) ** 2 for z, w in zip(zs, ws)) / wsum
-            std = math.sqrt(var)
-
-            consist = 1.0 - _clamp(std / 2.0, 0.0, 1.0)
-
-            mag = math.exp(-0.35 * (abs(zbar) ** 2))
-            info = 1.0 - mag
-
-            parts.append(float(w_m) * (0.70 * consist + 0.30 * info))
-
-        total = sum(parts) if parts else 0.0
-        return float(_clamp(total, 0.0, 1.0))
-
-    def _score_ancora(self, metricas: Dict[str, float], dna_last25: Dict[str, Any], cfg: MotorV2Config) -> float:
-        parts: List[float] = []
-        for metric, w_m in cfg.pesos_metricas.items():
-            if metric not in self.METRICAS_SUPORTADAS:
-                continue
-            x = float(metricas.get(metric, 0.0))
-            mean, std = _dna_get_stats(dna_last25, cfg.dna_anchor_window, metric)
-            std = std if std != 0 else 1.0
-            z = _clamp((x - mean) / std, -cfg.z_cap, cfg.z_cap)
-
-            az = abs(z)
-            anchor_score = math.exp(-((az - 0.75) ** 2) / 0.80)
-            parts.append(float(w_m) * float(anchor_score))
-
-        total = sum(parts) if parts else 0.0
-        return float(_clamp(total, 0.0, 1.0))
+    def _score_ancora(self, metrics, dna, cfg):
+        score = 0.0
+        for m, w in cfg.pesos_metricas.items():
+            mean, std = _dna_get_stats(dna, cfg.dna_anchor_window, m)
+            z = abs((metrics[m] - mean) / std)
+            score += w * math.exp(-((z - 0.75) ** 2) / 0.8)
+        return score
