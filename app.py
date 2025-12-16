@@ -1,5 +1,6 @@
 
 # app.py
+import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
@@ -11,6 +12,12 @@ from fgi_engine_v3 import MotorFGI_V3        # v3 (Contraste/DCR)
 from grupo_de_milhoes import GrupoMilhoes
 from regime_detector import RegimeDetector
 
+
+# ==============================
+#   Build identity (Render)
+# ==============================
+BUILD_COMMIT = os.environ.get("RENDER_GIT_COMMIT", "unknown")
+SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "unknown")
 
 app = FastAPI(title="ATHENA LABORATORIO PMF")
 
@@ -25,7 +32,7 @@ class PrototiposRequest(BaseModel):
     top_n: int = 30
     max_candidatos: int = 3000
 
-    # V2 (mantém compatível com o que você já vinha usando)
+    # V2
     windows: Optional[List[int]] = None
     dna_anchor_window: Optional[int] = None
     pesos_windows: Optional[Dict[str, float]] = None
@@ -51,6 +58,8 @@ def lab_status():
     return {
         "laboratorio": "ATHENA LABORATORIO PMF",
         "status": "online",
+        "build_commit": BUILD_COMMIT,
+        "service_id": SERVICE_ID,
         "motores": {
             "v1": "Filtro (congelado)",
             "v2": "Direcional / SCF",
@@ -102,35 +111,42 @@ def _extract_candidates_for_v3(v2_result: Dict[str, Any]) -> List[Dict[str, Any]
       - detail.metricas (dict numérico)
       - detail.scf_total (ou score)
     Tenta pegar isso da saída do V2.
+
+    Observação: muitos outputs antigos devolvem:
+      - "prototipos" (v1) com "detalhes" em vez de "detail.metricas"
+    Nesse caso, falhamos explicitamente porque V3 não pode operar sem vetor numérico.
     """
     top = None
     if isinstance(v2_result, dict):
         if isinstance(v2_result.get("top"), list):
             top = v2_result["top"]
         elif isinstance(v2_result.get("prototipos"), list):
-            # se algum V2 antigo devolve "prototipos", tenta usar
             top = v2_result["prototipos"]
 
     if not isinstance(top, list) or not top:
         raise HTTPException(status_code=500, detail="V2 não retornou lista de candidatos (top/prototipos).")
 
-    # Normaliza itens: precisam ser dict com detail.metricas
     normalized: List[Dict[str, Any]] = []
     for it in top:
         if not isinstance(it, dict) or "sequencia" not in it:
             continue
 
-        # schema v2 esperado: it["detail"]["metricas"] e it["detail"]["scf_total"]
         detail = it.get("detail") if isinstance(it.get("detail"), dict) else {}
         metricas = detail.get("metricas") if isinstance(detail.get("metricas"), dict) else None
         scf_total = detail.get("scf_total", it.get("score", 0.0))
 
-        if metricas is None:
-            # tenta fallback se vier "metricas" direto
-            metricas = it.get("metricas") if isinstance(it.get("metricas"), dict) else None
+        # fallback: alguns V2 podem colocar "metricas" direto
+        if metricas is None and isinstance(it.get("metricas"), dict):
+            metricas = it.get("metricas")
+
+        # se vier "detalhes" (schema v1), isso NÃO serve pro V3
+        if metricas is None and isinstance(it.get("detalhes"), dict):
+            raise HTTPException(
+                status_code=500,
+                detail="V3 exige V2 retornando detail.metricas (vetor numérico). Sua saída atual parece schema v1 ('detalhes')."
+            )
 
         if metricas is None:
-            # sem metricas não tem contraste vetorial => falha explícita
             raise HTTPException(
                 status_code=500,
                 detail="V3 exige V2 retornando detail.metricas. Sua saída do V2 não tem metricas."
@@ -169,6 +185,8 @@ def gerar_prototipos(req: PrototiposRequest):
         "dna_last25": dna,
         "regime": regime,
         "ultimo_concurso": regime.get("ultimo_concurso"),
+        "build_commit": BUILD_COMMIT,
+        "service_id": SERVICE_ID
     }
 
     # Grupo de Milhões
@@ -187,7 +205,6 @@ def gerar_prototipos(req: PrototiposRequest):
     )
 
     if engine == "v1":
-        # preserva seu schema antigo (se já existia assim)
         return {
             "engine_used": "v1",
             "prototipos": filtrados[:req.top_n],
@@ -229,7 +246,6 @@ def gerar_prototipos(req: PrototiposRequest):
     )
 
     if engine == "v2":
-        # devolve o que o V2 devolver, mas injeta contexto do lab pra debug
         if isinstance(resultado_v2, dict):
             resultado_v2["contexto_lab"] = contexto_lab
         return resultado_v2
@@ -249,7 +265,6 @@ def gerar_prototipos(req: PrototiposRequest):
         jaccard_penalty_threshold=req.jaccard_penalty_threshold
     )
 
-    # injeta contexto do lab também
     if isinstance(resultado_v3, dict):
         resultado_v3["contexto_lab"] = contexto_lab
 
