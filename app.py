@@ -2,6 +2,7 @@
 # app.py
 import os
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 
@@ -20,6 +21,26 @@ BUILD_COMMIT = os.environ.get("RENDER_GIT_COMMIT", "unknown")
 SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "unknown")
 
 app = FastAPI(title="ATHENA LABORATORIO PMF")
+
+
+# ==============================
+#   ROOT / HEALTH
+# ==============================
+
+@app.get("/")
+def root():
+    # Evita 404 na raiz e mata a confusão no celular:
+    # qualquer acesso ao domínio abre o Swagger.
+    return RedirectResponse(url="/docs")
+
+
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "build_commit": BUILD_COMMIT,
+        "service_id": SERVICE_ID
+    }
 
 
 # ==============================
@@ -111,10 +132,6 @@ def _extract_candidates_for_v3(v2_result: Dict[str, Any]) -> List[Dict[str, Any]
       - detail.metricas (dict numérico)
       - detail.scf_total (ou score)
     Tenta pegar isso da saída do V2.
-
-    Observação: muitos outputs antigos devolvem:
-      - "prototipos" (v1) com "detalhes" em vez de "detail.metricas"
-    Nesse caso, falhamos explicitamente porque V3 não pode operar sem vetor numérico.
     """
     top = None
     if isinstance(v2_result, dict):
@@ -135,11 +152,9 @@ def _extract_candidates_for_v3(v2_result: Dict[str, Any]) -> List[Dict[str, Any]
         metricas = detail.get("metricas") if isinstance(detail.get("metricas"), dict) else None
         scf_total = detail.get("scf_total", it.get("score", 0.0))
 
-        # fallback: alguns V2 podem colocar "metricas" direto
         if metricas is None and isinstance(it.get("metricas"), dict):
             metricas = it.get("metricas")
 
-        # se vier "detalhes" (schema v1), isso NÃO serve pro V3
         if metricas is None and isinstance(it.get("detalhes"), dict):
             raise HTTPException(
                 status_code=500,
@@ -176,7 +191,6 @@ def gerar_prototipos(req: PrototiposRequest):
     if engine not in ("v1", "v2", "v3"):
         raise HTTPException(status_code=400, detail="engine deve ser 'v1', 'v2' ou 'v3'")
 
-    # Contexto do laboratório
     detector = RegimeDetector()
     dna = detector.get_dna_last25()
     regime = detector.detectar_regime()
@@ -189,15 +203,17 @@ def gerar_prototipos(req: PrototiposRequest):
         "service_id": SERVICE_ID
     }
 
-    # Grupo de Milhões
     grupo = GrupoMilhoes()
-    candidatos = grupo.gerar_combinacoes()
+    candidatos = grupo.gerar_combinacoes(
+        k=15,
+        max_candidatos=req.max_candidatos,
+        shuffle=True,
+        seed=1337
+    )
     if not candidatos:
         raise HTTPException(status_code=500, detail="Grupo de Milhões vazio")
 
-    # =========================
     # v1 — FILTRO
-    # =========================
     motor_v1 = MotorFGI()
     filtrados = motor_v1.gerar_prototipos(
         candidatos=candidatos,
@@ -211,12 +227,9 @@ def gerar_prototipos(req: PrototiposRequest):
             "contexto_lab": contexto_lab
         }
 
-    # prepara lista de sequências para o V2
     seqs_filtradas = _extract_seq_list(filtrados)
 
-    # =========================
-    # v2 — SCF (re-ranking)
-    # =========================
+    # v2 — SCF
     overrides_v2: Dict[str, Any] = {
         "top_n": req.top_n,
         "max_candidatos": req.max_candidatos,
@@ -250,9 +263,7 @@ def gerar_prototipos(req: PrototiposRequest):
             resultado_v2["contexto_lab"] = contexto_lab
         return resultado_v2
 
-    # =========================
-    # v3 — CONTRASTE (rank final)
-    # =========================
+    # v3 — CONTRASTE
     candidatos_v3 = _extract_candidates_for_v3(resultado_v2)
 
     motor_v3 = MotorFGI_V3()
