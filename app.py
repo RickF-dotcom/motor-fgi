@@ -2,50 +2,36 @@
 # app.py
 import os
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 
-from fgi_engine_v2 import MotorFGI_V2
-from fgi_engine_v3 import MotorFGI_V3
+from fgi_engine import MotorFGI              # v1 (Filtro) - mantém
+from fgi_engine_v2 import MotorFGI_V2        # v2 (Direcional/SCF) - atualizado
+from fgi_engine_v3 import MotorFGI_V3        # v3 (Contraste/DCR) - garante contrato
 
-from grupo_de_milhoes import GrupoDeMilhoes
+from grupo_de_milhoes import GrupoMilhoes
 from regime_detector import RegimeDetector
 
 
 # ==============================
-#   Build identity (Render)
+# Build identity (Render)
 # ==============================
 BUILD_COMMIT = os.environ.get("RENDER_GIT_COMMIT", "unknown")
 SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "unknown")
+
 
 app = FastAPI(title="ATHENA LABORATORIO PMF")
 
 
 # ==============================
-#   ROOT / HEALTH
+# REQUEST
 # ==============================
-
-@app.get("/")
-def root():
-    return RedirectResponse(url="/docs")
-
-
-@app.get("/health")
-def health():
-    return {
-        "ok": True,
-        "build_commit": BUILD_COMMIT,
-        "service_id": SERVICE_ID
-    }
-
-
-# ==============================
-#   REQUEST
-# ==============================
-
 class PrototiposRequest(BaseModel):
     engine: str = "v1"  # v1 | v2 | v3
+
+    # tamanho da combinação (ex.: 15)
+    k: int = 15
 
     top_n: int = 30
     max_candidatos: int = 3000
@@ -60,7 +46,7 @@ class PrototiposRequest(BaseModel):
     z_cap: Optional[float] = None
     align_temperature: Optional[float] = None
 
-    # V3
+    # V3 (Contraste / DCR)
     alpha_contraste: float = 0.55
     beta_diversidade: float = 0.30
     gamma_base: float = 0.15
@@ -68,8 +54,26 @@ class PrototiposRequest(BaseModel):
 
 
 # ==============================
-#   STATUS
+# ROOT / HEALTH / STATUS
 # ==============================
+@app.get("/")
+def root():
+    # deixa o / devolver algo útil (mobile)
+    return {
+        "ok": True,
+        "laboratorio": "ATHENA LABORATORIO PMF",
+        "build_commit": BUILD_COMMIT,
+        "service_id": SERVICE_ID,
+        "docs": "/docs",
+        "openapi": "/openapi.json",
+        "endpoints": ["/lab/status", "/lab/dna_last25", "/lab/regime_atual", "/prototipos"],
+    }
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
 
 @app.get("/lab/status")
 def lab_status():
@@ -81,120 +85,201 @@ def lab_status():
         "motores": {
             "v1": "Pass-through (congelado)",
             "v2": "Direcional / SCF",
-            "v3": "Contraste / DCR"
-        }
+            "v3": "Contraste / DCR",
+        },
     }
 
 
 # ==============================
-#   DNA / REGIME
+# DNA / REGIME
 # ==============================
-
 @app.get("/lab/dna_last25")
 def dna_last25():
-    return RegimeDetector().get_dna_last25()
+    detector = RegimeDetector()
+    return detector.get_dna_last25()
 
 
 @app.get("/lab/regime_atual")
 def regime_atual():
-    return RegimeDetector().detectar_regime()
+    detector = RegimeDetector()
+    return detector.detectar_regime()
 
 
 # ==============================
-#   HELPERS
+# HELPERS
 # ==============================
-
-def _extract_candidates_for_v3(v2_result: Dict[str, Any]) -> List[Dict[str, Any]]:
-    top = v2_result.get("top")
-    if not isinstance(top, list):
-        raise HTTPException(500, "V2 não retornou lista válida")
-
-    out = []
-    for it in top:
-        detail = it.get("detail", {})
-        metricas = detail.get("metricas")
-        if not isinstance(metricas, dict):
-            raise HTTPException(500, "V3 exige metricas do V2")
-
-        out.append({
-            "sequencia": it["sequencia"],
-            "score": float(it.get("score", 0)),
-            "detail": {
-                "scf_total": float(detail.get("scf_total", 0)),
-                "metricas": metricas
-            }
-        })
+def _extract_seq_list(items: List[Any]) -> List[List[int]]:
+    """
+    Aceita:
+      - lista de listas (sequências)
+      - lista de dicts contendo "sequencia"
+    Retorna lista de listas de int.
+    """
+    out: List[List[int]] = []
+    for it in items:
+        if isinstance(it, dict) and "sequencia" in it:
+            out.append([int(x) for x in it["sequencia"]])
+        elif isinstance(it, (list, tuple)):
+            out.append([int(x) for x in it])
     return out
 
 
-# ==============================
-#   PROTÓTIPOS
-# ==============================
+def _extract_candidates_for_v3(v2_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    V3 precisa de candidatos com:
+      - sequencia
+      - detail.metricas (dict numérico)
+      - detail.scf_total (ou score)
+    """
+    top = None
+    if isinstance(v2_result, dict):
+        if isinstance(v2_result.get("top"), list):
+            top = v2_result["top"]
+        elif isinstance(v2_result.get("prototipos"), list):
+            top = v2_result["prototipos"]
 
+    if not isinstance(top, list) or not top:
+        raise HTTPException(status_code=500, detail="V2 não retornou lista de candidatos (top/prototipos).")
+
+    normalized: List[Dict[str, Any]] = []
+    for it in top:
+        if not isinstance(it, dict) or "sequencia" not in it:
+            continue
+
+        detail = it.get("detail") if isinstance(it.get("detail"), dict) else {}
+        metricas = detail.get("metricas") if isinstance(detail.get("metricas"), dict) else None
+        scf_total = detail.get("scf_total", it.get("score", 0.0))
+
+        if metricas is None:
+            metricas = it.get("metricas") if isinstance(it.get("metricas"), dict) else None
+
+        if metricas is None:
+            raise HTTPException(
+                status_code=500,
+                detail="V3 exige metricas do V2 (detail.metricas). Seu V2 não está expondo metricas."
+            )
+
+        normalized.append(
+            {
+                "sequencia": it["sequencia"],
+                "score": float(it.get("score", 0.0)),
+                "detail": {"scf_total": float(scf_total), "metricas": metricas},
+            }
+        )
+
+    if not normalized:
+        raise HTTPException(status_code=500, detail="Não consegui normalizar candidatos do V2 para o V3.")
+    return normalized
+
+
+# ==============================
+# PROTÓTIPOS
+# ==============================
 @app.post("/prototipos")
 def gerar_prototipos(req: PrototiposRequest):
+    engine = (req.engine or "v1").lower().strip()
+    if engine not in ("v1", "v2", "v3"):
+        raise HTTPException(status_code=400, detail="engine deve ser 'v1', 'v2' ou 'v3'")
 
-    engine = req.engine.lower()
+    if req.k <= 0:
+        raise HTTPException(status_code=400, detail="k inválido")
 
+    # Contexto do laboratório
     detector = RegimeDetector()
+    dna = detector.get_dna_last25()
+    regime = detector.detectar_regime()
+
     contexto_lab = {
-        "dna_last25": detector.get_dna_last25(),
-        "regime": detector.detectar_regime(),
-        "build_commit": BUILD_COMMIT
+        "dna_last25": dna,
+        "regime": regime,
+        "ultimo_concurso": regime.get("ultimo_concurso"),
     }
 
-    # =========================
-    # Grupo de Milhões (15 dezenas)
-    # =========================
-    grupo = GrupoDeMilhoes()
-    candidatos = grupo.get_candidatos(
-        k=15,
-        max_candidatos=req.max_candidatos,
-        shuffle=True,
-        seed=1337
-    )
+    # Grupo de Milhões (amostragem)
+    grupo = GrupoMilhoes()
+    try:
+        candidatos = grupo.get_candidatos(
+            k=req.k,
+            max_candidatos=req.max_candidatos,
+            shuffle=True,
+            seed=1337,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Falha no Grupo de Milhões: {e}")
 
     if not candidatos:
-        raise HTTPException(500, "Grupo de Milhões vazio")
+        raise HTTPException(status_code=500, detail="Grupo de Milhões vazio")
 
     # =========================
-    # v1 — PASS THROUGH
+    # v1 — FILTRO (mantém)
     # =========================
+    motor_v1 = MotorFGI()
+    filtrados = motor_v1.gerar_prototipos(
+        candidatos=candidatos,
+        top_n=req.max_candidatos,
+    )
+
     if engine == "v1":
         return {
             "engine_used": "v1",
-            "prototipos": candidatos[:req.top_n],
-            "contexto_lab": contexto_lab
+            "prototipos": filtrados[: req.top_n],
+            "contexto_lab": contexto_lab,
         }
 
+    seqs_filtradas = _extract_seq_list(filtrados)
+
     # =========================
-    # v2 — SCF
+    # v2 — SCF (re-ranking)
     # =========================
+    overrides_v2: Dict[str, Any] = {
+        "top_n": req.top_n,
+        "max_candidatos": req.max_candidatos,
+    }
+    if req.windows is not None:
+        overrides_v2["windows"] = req.windows
+    if req.dna_anchor_window is not None:
+        overrides_v2["dna_anchor_window"] = req.dna_anchor_window
+    if req.pesos_windows is not None:
+        overrides_v2["pesos_windows"] = req.pesos_windows
+    if req.pesos_metricas is not None:
+        overrides_v2["pesos_metricas"] = req.pesos_metricas
+    if req.redundancy_jaccard_threshold is not None:
+        overrides_v2["redundancy_jaccard_threshold"] = req.redundancy_jaccard_threshold
+    if req.redundancy_penalty is not None:
+        overrides_v2["redundancy_penalty"] = req.redundancy_penalty
+    if req.z_cap is not None:
+        overrides_v2["z_cap"] = req.z_cap
+    if req.align_temperature is not None:
+        overrides_v2["align_temperature"] = req.align_temperature
+
     motor_v2 = MotorFGI_V2()
     resultado_v2 = motor_v2.rerank(
-        candidatos=candidatos,
+        candidatos=seqs_filtradas,
         contexto_lab=contexto_lab,
-        overrides=req.dict()
+        overrides=overrides_v2,
     )
 
     if engine == "v2":
-        resultado_v2["contexto_lab"] = contexto_lab
+        if isinstance(resultado_v2, dict):
+            resultado_v2["contexto_lab"] = contexto_lab
         return resultado_v2
 
     # =========================
-    # v3 — CONTRASTE
+    # v3 — CONTRASTE (rank final)
     # =========================
-    motor_v3 = MotorFGI_V3()
     candidatos_v3 = _extract_candidates_for_v3(resultado_v2)
 
+    motor_v3 = MotorFGI_V3()
     resultado_v3 = motor_v3.rank(
         candidatos=candidatos_v3,
         top_n=req.top_n,
         alpha_contraste=req.alpha_contraste,
         beta_diversidade=req.beta_diversidade,
         gamma_base=req.gamma_base,
-        jaccard_penalty_threshold=req.jaccard_penalty_threshold
+        jaccard_penalty_threshold=req.jaccard_penalty_threshold,
     )
 
-    resultado_v3["contexto_lab"] = contexto_lab
-    return resultado_v3
+    if isinstance(resultado_v3, dict):
+        resultado_v3["contexto_lab"] = contexto_lab
+
+    return JSONResponse(content=resultado_v3)
