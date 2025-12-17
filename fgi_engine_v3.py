@@ -1,130 +1,152 @@
 # fgi_engine_v3.py
-# Motor v3 — Contrast Ranker (DCR)
-# Quebra empate crônico por contraste relativo + diversidade estrutural
-
 from __future__ import annotations
-from typing import List, Dict, Any, Sequence
+
+from dataclasses import dataclass
+from typing import Any, Dict, List
 import math
-import statistics
 
 
-# =========================
-# Utilidades
-# =========================
-
-def _euclidean(a: List[float], b: List[float]) -> float:
-    return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
-
-def _jaccard(a: Sequence[int], b: Sequence[int]) -> float:
+def _jaccard(a: List[int], b: List[int]) -> float:
     sa, sb = set(a), set(b)
-    return len(sa & sb) / len(sa | sb)
+    if not sa and not sb:
+        return 1.0
+    inter = len(sa & sb)
+    uni = len(sa | sb)
+    return inter / uni if uni else 0.0
 
-def _clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
+
+def _vec(metricas: Dict[str, float], keys: List[str]) -> List[float]:
+    return [float(metricas.get(k, 0.0)) for k in keys]
 
 
-# =========================
-# Motor V3
-# =========================
+def _cosine(u: List[float], v: List[float]) -> float:
+    dot = sum(ui * vi for ui, vi in zip(u, v))
+    nu = math.sqrt(sum(ui * ui for ui in u))
+    nv = math.sqrt(sum(vi * vi for vi in v))
+    if nu == 0.0 or nv == 0.0:
+        return 0.0
+    return dot / (nu * nv)
 
+
+@dataclass
 class MotorFGI_V3:
-    SCHEMA_VERSION = "v3.0"
-    ENGINE_MODE = "contrast_ranker"
+    """
+    V3 (Contraste / DCR)
+
+    Entrada: lista de candidatos (dict) contendo:
+      - sequencia: List[int]
+      - detail.metricas: Dict[str,float]
+      - detail.scf_total: float
+
+    Saída: top final com score_v3 e breakdown.
+    """
 
     def rank(
         self,
         candidatos: List[Dict[str, Any]],
-        top_n: int = 30,
+        top_n: int = 10,
         alpha_contraste: float = 0.55,
         beta_diversidade: float = 0.30,
         gamma_base: float = 0.15,
         jaccard_penalty_threshold: float = 0.75,
     ) -> Dict[str, Any]:
-        """
-        candidatos: lista já validada (saída do V2)
-        cada item DEVE conter:
-          - sequencia
-          - detail.scf_total (ou score)
-          - detail.metricas (numéricas)
-        """
+        if not candidatos:
+            return {"engine_used": "v3", "top": []}
 
-        # -------------------------
-        # 1. Vetorização
-        # -------------------------
-        vetores = []
-        base_scores = []
-
+        # garante chaves métricas comuns
+        metric_keys = None
         for c in candidatos:
-            metrics = c.get("detail", {}).get("metricas", {})
-            vec = [float(metrics[k]) for k in sorted(metrics.keys())]
-            vetores.append(vec)
-            base_scores.append(float(c.get("detail", {}).get("scf_total", c.get("score", 0.0))))
+            detail = c.get("detail", {}) if isinstance(c.get("detail"), dict) else {}
+            metricas = detail.get("metricas", {}) if isinstance(detail.get("metricas"), dict) else {}
+            if metricas:
+                metric_keys = sorted(list(metricas.keys()))
+                break
+        if not metric_keys:
+            raise ValueError("V3 exige metricas no payload (detail.metricas).")
 
-        if not vetores:
-            return {"engine": "v3", "top": []}
+        # vetoriza e calcula base
+        enriched: List[Dict[str, Any]] = []
+        for c in candidatos:
+            detail = c.get("detail", {}) if isinstance(c.get("detail"), dict) else {}
+            metricas = detail.get("metricas", {}) if isinstance(detail.get("metricas"), dict) else {}
+            scf_total = float(detail.get("scf_total", c.get("score", 0.0)))
+            v = _vec(metricas, metric_keys)
 
-        centroide = [
-            statistics.mean(col) for col in zip(*vetores)
-        ]
-
-        # -------------------------
-        # 2. Distância ao centroide (contraste)
-        # -------------------------
-        distancias = [
-            _euclidean(v, centroide) for v in vetores
-        ]
-
-        max_dist = max(distancias) if max(distancias) > 0 else 1.0
-        contraste_norm = [d / max_dist for d in distancias]
-
-        # -------------------------
-        # 3. Ranking com diversidade
-        # -------------------------
-        ranked = []
-        selecionados = []
-
-        for idx, c in sorted(
-            enumerate(candidatos),
-            key=lambda x: contraste_norm[x[0]],
-            reverse=True
-        ):
-            seq = c["sequencia"]
-            base = base_scores[idx]
-            contraste = contraste_norm[idx]
-
-            # diversidade vs já selecionados
-            diversidade = 1.0
-            if selecionados:
-                max_sim = max(_jaccard(seq, s) for s in selecionados)
-                if max_sim >= jaccard_penalty_threshold:
-                    diversidade = 1.0 - max_sim
-                diversidade = _clamp(diversidade, 0.0, 1.0)
-
-            score_final = (
-                alpha_contraste * contraste +
-                beta_diversidade * diversidade +
-                gamma_base * base
+            enriched.append(
+                {
+                    "sequencia": c["sequencia"],
+                    "base": scf_total,
+                    "metricas": metricas,
+                    "vec": v,
+                }
             )
 
-            ranked.append({
-                "sequencia": seq,
-                "score": score_final,
-                "detail": {
-                    "contraste": contraste,
-                    "diversidade": diversidade,
-                    "base_scf": base
-                }
-            })
+        # score = alpha*contraste + beta*diversidade + gamma*base
+        # contraste aqui é "distância" do centro (média vetorial) => mais diferente do miolo, maior contraste
+        mean = [0.0] * len(metric_keys)
+        for e in enriched:
+            for i, val in enumerate(e["vec"]):
+                mean[i] += val
+        mean = [m / max(1, len(enriched)) for m in mean]
 
-            selecionados.append(seq)
-            if len(ranked) >= top_n:
+        def contrast_score(vec: List[float]) -> float:
+            # 1 - cosine(similarity) com o centro
+            sim = _cosine(vec, mean)
+            return 1.0 - sim
+
+        # pré-score
+        for e in enriched:
+            e["contraste"] = float(contrast_score(e["vec"]))
+
+        # seleção gulosa com diversidade (anti-jaccard)
+        enriched.sort(key=lambda x: (x["contraste"], x["base"]), reverse=True)
+
+        selected: List[Dict[str, Any]] = []
+        for cand in enriched:
+            if len(selected) >= top_n:
                 break
 
-        ranked.sort(key=lambda x: x["score"], reverse=True)
+            # diversidade: penaliza Jaccard alto com selecionados
+            pen = 0.0
+            for prev in selected:
+                j = _jaccard(cand["sequencia"], prev["sequencia"])
+                if j >= jaccard_penalty_threshold:
+                    pen += (j - jaccard_penalty_threshold) / max(1e-9, (1.0 - jaccard_penalty_threshold))
+
+            # diversidade score = 1 - penalidade normalizada (clamp)
+            diversidade = 1.0 - min(1.0, pen)
+
+            score_v3 = (
+                alpha_contraste * float(cand["contraste"])
+                + beta_diversidade * float(diversidade)
+                + gamma_base * float(cand["base"])
+            )
+
+            selected.append(
+                {
+                    "sequencia": cand["sequencia"],
+                    "score": float(score_v3),
+                    "detail": {
+                        "score_v3": float(score_v3),
+                        "contraste": float(cand["contraste"]),
+                        "diversidade": float(diversidade),
+                        "base_scf": float(cand["base"]),
+                        "metricas": cand["metricas"],
+                        "metric_keys": metric_keys,
+                    },
+                }
+            )
+
+        selected.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
 
         return {
             "engine_used": "v3",
-            "schema_version": self.SCHEMA_VERSION,
-            "mode": self.ENGINE_MODE,
-            "top": ranked
+            "top": selected,
+            "config_used": {
+                "top_n": top_n,
+                "alpha_contraste": alpha_contraste,
+                "beta_diversidade": beta_diversidade,
+                "gamma_base": gamma_base,
+                "jaccard_penalty_threshold": jaccard_penalty_threshold,
+            },
         }
