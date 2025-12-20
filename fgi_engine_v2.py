@@ -1,12 +1,12 @@
 
 # fgi_engine_v2.py
 from typing import List, Dict, Any
-import math
+
 
 class MotorFGI_V2:
     """
     V2 — Direcional / SCF
-    GARANTE contrato:
+    CONTRATO GARANTIDO:
       - sequencia
       - score
       - detail.metricas (dict numérico)
@@ -17,26 +17,20 @@ class MotorFGI_V2:
         pass
 
     def _calc_metricas_basicas(self, seq: List[int], contexto_lab: Dict[str, Any]) -> Dict[str, float]:
-        """
-        Métricas mínimas e determinísticas.
-        Pode evoluir depois — aqui é contrato, não sofisticação.
-        """
         dna = contexto_lab.get("dna_last25", {})
         freq = dna.get("frequencia", {})
 
-        soma_freq = sum(freq.get(str(n), 0) for n in seq)
-        media = soma_freq / max(len(seq), 1)
+        soma_freq = sum(freq.get(str(n), 0.0) for n in seq)
+        tamanho = float(len(seq))
+        media = soma_freq / max(tamanho, 1.0)
 
         return {
             "frequencia_media": float(media),
             "soma_frequencia": float(soma_freq),
-            "tamanho": float(len(seq)),
+            "tamanho": tamanho,
         }
 
     def _calc_scf_total(self, metricas: Dict[str, float]) -> float:
-        """
-        SCF simples, estável e contínuo.
-        """
         return (
             0.6 * metricas.get("frequencia_media", 0.0)
             + 0.4 * metricas.get("tamanho", 0.0)
@@ -49,7 +43,7 @@ class MotorFGI_V2:
         overrides: Dict[str, Any],
     ) -> Dict[str, Any]:
 
-        top_n = overrides.get("top_n", 10)
+        top_n = int(overrides.get("top_n", 10))
 
         resultados: List[Dict[str, Any]] = []
 
