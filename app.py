@@ -1,14 +1,13 @@
-
 # app.py
 import os
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 
 from fgi_engine import MotorFGI              # v1 (Filtro) - mantém
-from fgi_engine_v2 import MotorFGI_V2        # v2 (Direcional/SCF) - atualizado
-from fgi_engine_v3 import MotorFGI_V3        # v3 (Contraste/DCR) - garante contrato
+from fgi_engine_v2 import MotorFGI_V2        # v2 (Direcional/SCF)
+from fgi_engine_v3 import MotorFGI_V3        # v3 (Contraste/DCR)
 
 from grupo_de_milhoes import GrupoMilhoes
 from regime_detector import RegimeDetector
@@ -20,15 +19,14 @@ from regime_detector import RegimeDetector
 BUILD_COMMIT = os.environ.get("RENDER_GIT_COMMIT", "unknown")
 SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "unknown")
 
-
 app = FastAPI(title="ATHENA LABORATORIO PMF")
 
 
 # ==============================
-# REQUEST
+# REQUESTS
 # ==============================
 class PrototiposRequest(BaseModel):
-    engine: str = "v1"  # v1 | v2 | v3
+    engine: str = "v1"  # v1 | v2  (v3 sai daqui)
 
     # tamanho da combinação (ex.: 15)
     k: int = 15
@@ -46,11 +44,17 @@ class PrototiposRequest(BaseModel):
     z_cap: Optional[float] = None
     align_temperature: Optional[float] = None
 
-    # V3 (Contraste / DCR)
+
+class V3ContrasteRequest(BaseModel):
+    # knobs do V3
+    top_n: int = 10
     alpha_contraste: float = 0.55
     beta_diversidade: float = 0.30
     gamma_base: float = 0.15
     jaccard_penalty_threshold: float = 0.75
+
+    # ENTRADA OBRIGATÓRIA: JSON inteiro retornado pelo V2
+    input_metrics: Dict[str, Any]
 
 
 # ==============================
@@ -58,7 +62,6 @@ class PrototiposRequest(BaseModel):
 # ==============================
 @app.get("/")
 def root():
-    # deixa o / devolver algo útil (mobile)
     return {
         "ok": True,
         "laboratorio": "ATHENA LABORATORIO PMF",
@@ -66,7 +69,13 @@ def root():
         "service_id": SERVICE_ID,
         "docs": "/docs",
         "openapi": "/openapi.json",
-        "endpoints": ["/lab/status", "/lab/dna_last25", "/lab/regime_atual", "/prototipos"],
+        "endpoints": [
+            "/lab/status",
+            "/lab/dna_last25",
+            "/lab/regime_atual",
+            "/prototipos",
+            "/v3/contraste",
+        ],
     }
 
 
@@ -83,9 +92,9 @@ def lab_status():
         "build_commit": BUILD_COMMIT,
         "service_id": SERVICE_ID,
         "motores": {
-            "v1": "Pass-through (congelado)",
+            "v1": "Filtro / baseline (congelado)",
             "v2": "Direcional / SCF",
-            "v3": "Contraste / DCR",
+            "v3": "Contraste / DCR (endpoint dedicado /v3/contraste)",
         },
     }
 
@@ -130,6 +139,7 @@ def _extract_candidates_for_v3(v2_result: Dict[str, Any]) -> List[Dict[str, Any]
       - sequencia
       - detail.metricas (dict numérico)
       - detail.scf_total (ou score)
+    Aceita v2_result contendo 'top' ou 'prototipos'.
     """
     top = None
     if isinstance(v2_result, dict):
@@ -139,7 +149,7 @@ def _extract_candidates_for_v3(v2_result: Dict[str, Any]) -> List[Dict[str, Any]
             top = v2_result["prototipos"]
 
     if not isinstance(top, list) or not top:
-        raise HTTPException(status_code=500, detail="V2 não retornou lista de candidatos (top/prototipos).")
+        raise HTTPException(status_code=422, detail="input_metrics não contém lista válida (esperado: top).")
 
     normalized: List[Dict[str, Any]] = []
     for it in top:
@@ -155,45 +165,56 @@ def _extract_candidates_for_v3(v2_result: Dict[str, Any]) -> List[Dict[str, Any]
 
         if metricas is None:
             raise HTTPException(
-                status_code=500,
-                detail="V3 exige metricas do V2 (detail.metricas). Seu V2 não está expondo metricas."
+                status_code=422,
+                detail="V3 exige metricas do V2: cada item precisa ter detail.metricas (dict).",
             )
 
         normalized.append(
             {
                 "sequencia": it["sequencia"],
                 "score": float(it.get("score", 0.0)),
-                "detail": {"scf_total": float(scf_total), "metricas": metricas},
+                "detail": {
+                    "scf_total": float(scf_total),
+                    "metricas": metricas,
+                },
             }
         )
 
     if not normalized:
-        raise HTTPException(status_code=500, detail="Não consegui normalizar candidatos do V2 para o V3.")
+        raise HTTPException(status_code=422, detail="Não consegui normalizar input_metrics.top para o V3.")
     return normalized
 
 
+def _contexto_lab() -> Dict[str, Any]:
+    detector = RegimeDetector()
+    dna = detector.get_dna_last25()
+    regime = detector.detectar_regime()
+    return {
+        "dna_last25": dna,
+        "regime": regime,
+        "ultimo_concurso": regime.get("ultimo_concurso"),
+        "build_commit": BUILD_COMMIT,
+    }
+
+
 # ==============================
-# PROTÓTIPOS
+# PROTÓTIPOS (v1/v2 APENAS)
 # ==============================
 @app.post("/prototipos")
 def gerar_prototipos(req: PrototiposRequest):
     engine = (req.engine or "v1").lower().strip()
-    if engine not in ("v1", "v2", "v3"):
-        raise HTTPException(status_code=400, detail="engine deve ser 'v1', 'v2' ou 'v3'")
+
+    # trava v3 aqui (agora é endpoint dedicado)
+    if engine == "v3":
+        raise HTTPException(status_code=422, detail="V3 não roda em /prototipos. Use /v3/contraste.")
+
+    if engine not in ("v1", "v2"):
+        raise HTTPException(status_code=400, detail="engine deve ser 'v1' ou 'v2'")
 
     if req.k <= 0:
         raise HTTPException(status_code=400, detail="k inválido")
 
-    # Contexto do laboratório
-    detector = RegimeDetector()
-    dna = detector.get_dna_last25()
-    regime = detector.detectar_regime()
-
-    contexto_lab = {
-        "dna_last25": dna,
-        "regime": regime,
-        "ultimo_concurso": regime.get("ultimo_concurso"),
-    }
+    contexto_lab = _contexto_lab()
 
     # Grupo de Milhões (amostragem)
     grupo = GrupoMilhoes()
@@ -226,11 +247,11 @@ def gerar_prototipos(req: PrototiposRequest):
             "contexto_lab": contexto_lab,
         }
 
-    seqs_filtradas = _extract_seq_list(filtrados)
-
     # =========================
     # v2 — SCF (re-ranking)
     # =========================
+    seqs_filtradas = _extract_seq_list(filtrados)
+
     overrides_v2: Dict[str, Any] = {
         "top_n": req.top_n,
         "max_candidatos": req.max_candidatos,
@@ -259,15 +280,27 @@ def gerar_prototipos(req: PrototiposRequest):
         overrides=overrides_v2,
     )
 
-    if engine == "v2":
-        if isinstance(resultado_v2, dict):
-            resultado_v2["contexto_lab"] = contexto_lab
-        return resultado_v2
+    if isinstance(resultado_v2, dict):
+        resultado_v2["contexto_lab"] = contexto_lab
 
-    # =========================
-    # v3 — CONTRASTE (rank final)
-    # =========================
-    candidatos_v3 = _extract_candidates_for_v3(resultado_v2)
+    return JSONResponse(content=resultado_v2)
+
+
+# ==============================
+# V3 (endpoint dedicado)
+# ==============================
+@app.post("/v3/contraste")
+def v3_contraste(req: V3ContrasteRequest = Body(...)):
+    """
+    V3 roda APENAS a partir do output do V2 (input_metrics).
+    Isso elimina o looping "V3 exige métricas do V2".
+    """
+    engine_used = str(req.input_metrics.get("engine_used", "")).lower().strip()
+    if engine_used != "v2":
+        raise HTTPException(status_code=422, detail="V3 exige métricas do V2 (input_metrics.engine_used='v2').")
+
+    # normaliza input do V2 para o formato do V3
+    candidatos_v3 = _extract_candidates_for_v3(req.input_metrics)
 
     motor_v3 = MotorFGI_V3()
     resultado_v3 = motor_v3.rank(
@@ -280,6 +313,6 @@ def gerar_prototipos(req: PrototiposRequest):
     )
 
     if isinstance(resultado_v3, dict):
-        resultado_v3["contexto_lab"] = contexto_lab
+        resultado_v3["contexto_lab"] = _contexto_lab()
 
     return JSONResponse(content=resultado_v3)
