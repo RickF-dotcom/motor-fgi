@@ -1,40 +1,42 @@
 
 # fgi_engine_v2.py
 from typing import List, Dict, Any
-import math
 
 
 class MotorFGI_V2:
     """
     V2 — Direcional / SCF
-    CONTRATO GARANTIDO:
-      - sequencia
-      - score
-      - detail.metricas (dict numérico)
-      - detail.scf_total (float)
+
+    CONTRATO GARANTIDO (OBRIGATÓRIO):
+      - sequencia: List[int]
+      - score: float
+      - detail.metricas: Dict[str, float]
+      - detail.scf_total: float
+
+    Este motor NUNCA retorna candidatos sem métricas.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         pass
 
-    # =========================================================
-    # MÉTRICAS BÁSICAS (sempre retorna dict numérico)
-    # =========================================================
+    # =====================================================
+    # MÉTRICAS BÁSICAS (determinísticas, sempre numéricas)
+    # =====================================================
     def _calc_metricas_basicas(
         self,
         seq: List[int],
-        contexto_lab: Dict[str, Any]
+        contexto_lab: Dict[str, Any],
     ) -> Dict[str, float]:
 
-        dna = contexto_lab.get("dna_last25", {}) or {}
-        freq = dna.get("frequencia", {}) or {}
+        dna = contexto_lab.get("dna_last25") or {}
+        freq = dna.get("frequencia") or {}
 
-        soma_freq = 0.0
+        soma_freq: float = 0.0
         for n in seq:
             soma_freq += float(freq.get(str(n), 0.0))
 
-        tamanho = float(len(seq)) if seq else 0.0
-        freq_media = soma_freq / tamanho if tamanho > 0 else 0.0
+        tamanho: float = float(len(seq))
+        freq_media: float = soma_freq / tamanho if tamanho > 0 else 0.0
 
         return {
             "frequencia_media": freq_media,
@@ -42,18 +44,18 @@ class MotorFGI_V2:
             "tamanho": tamanho,
         }
 
-    # =========================================================
-    # SCF TOTAL — contínuo, estável
-    # =========================================================
+    # =====================================================
+    # SCF TOTAL (score contínuo, estável)
+    # =====================================================
     def _calc_scf_total(self, metricas: Dict[str, float]) -> float:
         return (
             0.6 * metricas.get("frequencia_media", 0.0)
             + 0.4 * metricas.get("tamanho", 0.0)
         )
 
-    # =========================================================
+    # =====================================================
     # RERANK PRINCIPAL
-    # =========================================================
+    # =====================================================
     def rerank(
         self,
         candidatos: List[List[int]],
@@ -61,13 +63,12 @@ class MotorFGI_V2:
         overrides: Dict[str, Any],
     ) -> Dict[str, Any]:
 
-        top_n = int(overrides.get("top_n", 10))
-
+        top_n: int = int(overrides.get("top_n", 10))
         resultados: List[Dict[str, Any]] = []
 
         for seq in candidatos:
-            # blindagem
-            if not isinstance(seq, (list, tuple)) or not seq:
+            # blindagem estrutural
+            if not isinstance(seq, list) or not seq:
                 continue
 
             metricas = self._calc_metricas_basicas(seq, contexto_lab)
@@ -84,7 +85,7 @@ class MotorFGI_V2:
                 }
             )
 
-        # ordenação estável
+        # ordenação determinística
         resultados.sort(key=lambda x: x["score"], reverse=True)
 
         return {
