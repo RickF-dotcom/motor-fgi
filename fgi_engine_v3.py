@@ -1,156 +1,137 @@
-
 # fgi_engine_v3.py
-
 from typing import List, Dict, Any
 import math
 
 
 class MotorFGI_V3:
     """
-    V3 – Contrast / DCR
-    CONTRATO GARANTIDO:
-      - engine_used
-      - schema_version
-      - score_model
-      - top (lista ordenada)
+    V3 – Contraste / DCR
+    Blindado contra inconsistências do V2
     """
 
     def __init__(self):
         pass
 
-    # ============================================================
-    # MÉTRICAS BÁSICAS (sempre seguras)
-    # ============================================================
-    def _calc_metricas_basicas(
-        self,
-        seq: List[int],
-        contexto_lab: Dict[str, Any],
-    ) -> Dict[str, float]:
+    # ==========================================================
+    # Normalização dura do contrato vindo do V2
+    # ==========================================================
+    def _normalize_v2_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(item, dict):
+            return {}
 
-        dna = contexto_lab.get("dna_last25", {}) or {}
-        freq = dna.get("frequencia", {}) or {}
+        seq = item.get("sequencia") or item.get("sequence")
+        if not isinstance(seq, (list, tuple)) or not seq:
+            return {}
 
-        soma_freq = 0.0
-        for n in seq:
-            soma_freq += float(freq.get(str(n), 0.0))
+        detail = item.get("detail", {})
+        if not isinstance(detail, dict):
+            detail = {}
 
-        tamanho = float(len(seq)) if seq else 0.0
-        freq_media = soma_freq / tamanho if tamanho > 0 else 0.0
-
-        return {
-            "frequencia_media": freq_media,
-            "soma_frequencia": soma_freq,
-            "tamanho": tamanho,
-        }
-
-    # ============================================================
-    # DIVERSIDADE (entropia simples)
-    # ============================================================
-    def _calc_diversidade(self, seq: List[int]) -> float:
-        if not seq:
-            return 0.0
-
-        valores = {}
-        for n in seq:
-            valores[n] = valores.get(n, 0) + 1
-
-        total = float(len(seq))
-        entropia = 0.0
-
-        for c in valores.values():
-            p = c / total
-            if p > 0:
-                entropia -= p * math.log(p)
-
-        return entropia
-
-    # ============================================================
-    # CONTRASTE (anti-clone)
-    # ============================================================
-    def _calc_contraste(self, freq_media: float) -> float:
-        # Quanto menor a frequência média, maior o contraste
-        return 1.0 / (1.0 + freq_media)
-
-    # ============================================================
-    # SCORE FINAL DCR (blindado)
-    # ============================================================
-    def _calc_score_dcr(
-        self,
-        metricas: Dict[str, float],
-        diversidade: float,
-        contraste: float,
-        alpha: float,
-        beta: float,
-        gamma: float,
-    ) -> float:
-
-        base = (
-            alpha * contraste +
-            beta * diversidade +
-            gamma * metricas.get("tamanho", 0.0)
+        # aceita metricas ou metrics
+        metricas = (
+            detail.get("metricas")
+            or detail.get("metrics")
+            or {}
         )
 
-        return float(base)
+        if not isinstance(metricas, dict):
+            metricas = {}
 
-    # ============================================================
+        # força valores numéricos
+        metricas_num = {}
+        for k, v in metricas.items():
+            try:
+                metricas_num[k] = float(v)
+            except Exception:
+                continue
+
+        scf_total = detail.get("scf_total", item.get("score", 0.0))
+        try:
+            scf_total = float(scf_total)
+        except Exception:
+            scf_total = 0.0
+
+        return {
+            "sequencia": [int(x) for x in seq],
+            "metricas": metricas_num,
+            "scf_total": scf_total,
+        }
+
+    # ==========================================================
+    # Score DCR simples, estável e contínuo
+    # ==========================================================
+    def _calc_dcr_score(self, metricas: Dict[str, float], scf_total: float) -> float:
+        base = scf_total
+
+        # reforços defensivos
+        diversidade = metricas.get("diversidade", 0.0)
+        frequencia = metricas.get("frequencia_media", 0.0)
+
+        score = (
+            0.6 * base
+            + 0.25 * diversidade
+            + 0.15 * frequencia
+        )
+
+        if math.isnan(score) or math.isinf(score):
+            return 0.0
+
+        return float(score)
+
+    # ==========================================================
     # RERANK PRINCIPAL
-    # ============================================================
+    # ==========================================================
     def rerank(
         self,
-        candidatos: List[List[int]],
-        contexto_lab: Dict[str, Any],
+        candidatos_v2: List[Dict[str, Any]],
         overrides: Dict[str, Any],
     ) -> Dict[str, Any]:
 
-        # ---------------- parâmetros ----------------
         top_n = int(overrides.get("top_n", 10))
 
-        alpha = float(overrides.get("alpha_contraste", 0.55))
-        beta = float(overrides.get("beta_diversidade", 0.30))
-        gamma = float(overrides.get("gamma_base", 0.15))
+        if not isinstance(candidatos_v2, list) or not candidatos_v2:
+            return {
+                "engine_used": "v3",
+                "schema_version": "v3.0",
+                "error": "lista_v2_vazia",
+                "top": [],
+            }
 
-        resultados: List[Dict[str, Any]] = []
+        normalizados: List[Dict[str, Any]] = []
 
-        # ---------------- loop seguro ----------------
-        for seq in candidatos:
-
-            if not isinstance(seq, (list, tuple)):
+        for item in candidatos_v2:
+            norm = self._normalize_v2_item(item)
+            if not norm:
                 continue
-            if not seq:
-                continue
 
-            seq = [int(x) for x in seq]
-
-            metricas = self._calc_metricas_basicas(seq, contexto_lab)
-            diversidade = self._calc_diversidade(seq)
-            contraste = self._calc_contraste(metricas["frequencia_media"])
-
-            score = self._calc_score_dcr(
-                metricas=metricas,
-                diversidade=diversidade,
-                contraste=contraste,
-                alpha=alpha,
-                beta=beta,
-                gamma=gamma,
+            score = self._calc_dcr_score(
+                norm["metricas"],
+                norm["scf_total"],
             )
 
-            resultados.append({
-                "sequencia": seq,
+            normalizados.append({
+                "sequencia": norm["sequencia"],
                 "score": score,
                 "detail": {
-                    "metricas": metricas,
-                    "diversidade": diversidade,
-                    "contraste": contraste,
-                    "score_dcr": score,
-                }
+                    "metricas": norm["metricas"],
+                    "scf_total": norm["scf_total"],
+                    "dcr_score": score,
+                },
             })
 
-        # ---------------- ordenação ----------------
-        resultados.sort(key=lambda x: x["score"], reverse=True)
+        if not normalizados:
+            return {
+                "engine_used": "v3",
+                "schema_version": "v3.0",
+                "error": "normalizacao_falhou",
+                "top": [],
+            }
+
+        normalizados.sort(key=lambda x: x["score"], reverse=True)
 
         return {
             "engine_used": "v3",
             "schema_version": "v3.0",
-            "score_model": "DCR",
-            "top": resultados[:top_n],
+            "score_mode": "contrast_dcr",
+            "top": normalizados[:top_n],
         }
