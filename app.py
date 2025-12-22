@@ -1,14 +1,16 @@
 # app.py
 import os
+import traceback
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-
-from fgi_engine import MotorFGI              # v1 (Filtro) - congelado
-from fgi_engine_v2 import MotorFGI_V2        # v2 (Direcional/SCF) - contrato + métricas
-from fgi_engine_v3 import MotorFGI_V3        # v3 (Contraste/DCR) - depende de métricas do v2
+from fgi_engine import MotorFGI              # v1 (Filtro) - mantém
+from fgi_engine_v2 import MotorFGI_V2        # v2 (Direcional/SCF) - contrato mínimo
+from fgi_engine_v3 import MotorFGI_V3        # v3 (Contraste/DCR)
 
 from grupo_de_milhoes import GrupoMilhoes
 from regime_detector import RegimeDetector
@@ -20,18 +22,43 @@ from regime_detector import RegimeDetector
 BUILD_COMMIT = os.environ.get("RENDER_GIT_COMMIT", "unknown")
 SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "unknown")
 
+# Em Render, por padrão: não expõe stacktrace.
+# A gente vai expor de forma controlada:
+DEBUG_ERRORS = os.environ.get("DEBUG_ERRORS", "1") == "1"
 
-app = FastAPI(
-    title="ATHENA LABORATORIO PMF",
-    version="1.3.1",
+app = FastAPI(title="ATHENA LABORATORIO PMF", version="1.3.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
+
+# ==============================
+# GLOBAL ERROR HANDLER (mostra o erro real)
+# ==============================
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    tb = traceback.format_exc()
+    payload = {
+        "ok": False,
+        "error_type": exc.__class__.__name__,
+        "error": str(exc),
+        "path": str(request.url.path),
+    }
+    if DEBUG_ERRORS:
+        payload["traceback"] = tb
+    return JSONResponse(status_code=500, content=payload)
 
 
 # ==============================
 # REQUEST MODEL (contrato real)
 # ==============================
 class PrototiposRequest(BaseModel):
-    # engine é obrigatório e SEM fallback silencioso
+    # engine obrigatório e sem fallback silencioso (contrato)
     engine: str = Field(..., description="v1 | v2 | v3")
 
     # tamanho da combinação (ex.: 15)
@@ -40,7 +67,7 @@ class PrototiposRequest(BaseModel):
     top_n: int = 30
     max_candidatos: int = 3000
 
-    # V2 (SCF)
+    # V2
     windows: Optional[List[int]] = None
     dna_anchor_window: Optional[int] = None
     pesos_windows: Optional[Dict[str, float]] = None
@@ -69,18 +96,13 @@ def root():
         "service_id": SERVICE_ID,
         "docs": "/docs",
         "openapi": "/openapi.json",
-        "endpoints": [
-            "/lab/status",
-            "/lab/dna_last25",
-            "/lab/regime_atual",
-            "/prototipos",
-        ],
+        "endpoints": ["/lab/status", "/lab/dna_last25", "/lab/regime_atual", "/prototipos"],
     }
 
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "build_commit": BUILD_COMMIT, "service_id": SERVICE_ID}
 
 
 @app.get("/lab/status")
@@ -90,21 +112,11 @@ def lab_status():
         "status": "online",
         "build_commit": BUILD_COMMIT,
         "service_id": SERVICE_ID,
+        "debug_errors": DEBUG_ERRORS,
         "motores": {
             "v1": "Pass-through (congelado)",
-            "v2": "Direcional / SCF (metricas obrigatórias)",
-            "v3": "Contraste / DCR (depende de metricas do v2)",
-        },
-        "contrato": {
-            "v2_output_required": {
-                "top": [
-                    {
-                        "sequencia": "List[int]",
-                        "score": "float",
-                        "detail": {"metricas": "Dict[str,float]", "scf_total": "float"},
-                    }
-                ]
-            }
+            "v2": "Direcional / SCF",
+            "v3": "Contraste / DCR",
         },
     }
 
@@ -128,135 +140,118 @@ def regime_atual():
 # HELPERS
 # ==============================
 def _extract_seq_list(items: List[Any]) -> List[List[int]]:
-    """
-    Aceita:
-      - lista de listas (sequências)
-      - lista de dicts contendo "sequencia"
-    Retorna lista de listas de int.
-    """
     out: List[List[int]] = []
     for it in items:
         if isinstance(it, dict) and "sequencia" in it:
-            try:
-                out.append([int(x) for x in it["sequencia"]])
-            except Exception:
-                continue
+            out.append([int(x) for x in it["sequencia"]])
         elif isinstance(it, (list, tuple)):
-            try:
-                out.append([int(x) for x in it])
-            except Exception:
-                continue
+            out.append([int(x) for x in it])
     return out
 
 
-def _normalize_v2_result(resultado_v2: Any) -> Dict[str, Any]:
-    """
-    Garante que o V2 devolveu um dict com lista em `top`.
-    Se vier como `prototipos`, converte.
-    """
-    if not isinstance(resultado_v2, dict):
-        raise HTTPException(status_code=500, detail="V2 retornou payload inválido (não é dict).")
+def _extract_candidates_for_v3(v2_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    top = None
+    if isinstance(v2_result, dict):
+        if isinstance(v2_result.get("top"), list):
+            top = v2_result["top"]
+        elif isinstance(v2_result.get("prototipos"), list):
+            top = v2_result["prototipos"]
 
-    if isinstance(resultado_v2.get("top"), list):
-        return resultado_v2
-
-    if isinstance(resultado_v2.get("prototipos"), list):
-        resultado_v2["top"] = resultado_v2["prototipos"]
-        return resultado_v2
-
-    raise HTTPException(status_code=500, detail="V2 não retornou lista de candidatos em `top`/`prototipos`.")
-
-
-def _extract_candidates_for_v3(resultado_v2: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    V3 precisa de candidatos com:
-      - sequencia
-      - detail.metricas (dict numérico)
-      - detail.scf_total (float)
-    """
-    top = resultado_v2.get("top")
     if not isinstance(top, list) or not top:
-        raise HTTPException(status_code=500, detail="V2 retornou `top` vazio; V3 não pode rodar.")
+        raise HTTPException(status_code=500, detail="V2 não retornou lista de candidatos (top/prototipos).")
 
     normalized: List[Dict[str, Any]] = []
-
     for it in top:
         if not isinstance(it, dict) or "sequencia" not in it:
             continue
 
-        seq = it.get("sequencia")
-        if not isinstance(seq, list) or not seq:
-            continue
-
-        # detail
         detail = it.get("detail") if isinstance(it.get("detail"), dict) else {}
+        metricas = detail.get("metricas") if isinstance(detail.get("metricas"), dict) else None
+        scf_total = detail.get("scf_total", it.get("score", 0.0))
 
-        metricas = detail.get("metricas")
-        if metricas is None and isinstance(it.get("metricas"), dict):
-            metricas = it.get("metricas")
+        if metricas is None:
+            metricas = it.get("metricas") if isinstance(it.get("metricas"), dict) else None
 
-        if not isinstance(metricas, dict) or not metricas:
+        if metricas is None:
             raise HTTPException(
                 status_code=500,
-                detail="V3 exige metricas do V2 (detail.metricas). Seu V2 não está expondo metricas.",
+                detail="V3 exige metricas do V2. Seu V2 não está expondo detail.metricas (dict)."
             )
-
-        # scf_total obrigatório (cai no score se não existir, mas força float)
-        scf_total = detail.get("scf_total", it.get("score", 0.0))
 
         normalized.append(
             {
-                "sequencia": [int(x) for x in seq],
+                "sequencia": [int(x) for x in it["sequencia"]],
                 "score": float(it.get("score", 0.0)),
-                "detail": {
-                    "metricas": metricas,
-                    "scf_total": float(scf_total),
-                },
+                "detail": {"scf_total": float(scf_total), "metricas": metricas},
             }
         )
 
     if not normalized:
         raise HTTPException(status_code=500, detail="Não consegui normalizar candidatos do V2 para o V3.")
-
     return normalized
 
 
-def _build_contexto_lab() -> Dict[str, Any]:
+# ==============================
+# PROTÓTIPOS
+# ==============================
+@app.post("/prototipos")
+def gerar_prototipos(req: PrototiposRequest):
+    engine = (req.engine or "").lower().strip()
+    if engine not in ("v1", "v2", "v3"):
+        raise HTTPException(status_code=400, detail="engine deve ser 'v1', 'v2' ou 'v3'")
+
+    if req.k <= 0:
+        raise HTTPException(status_code=400, detail="k inválido")
+    if req.top_n <= 0:
+        raise HTTPException(status_code=400, detail="top_n inválido")
+    if req.max_candidatos <= 0:
+        raise HTTPException(status_code=400, detail="max_candidatos inválido")
+
+    # Contexto do laboratório
     detector = RegimeDetector()
     dna = detector.get_dna_last25()
     regime = detector.detectar_regime()
-    return {
+
+    contexto_lab = {
         "dna_last25": dna,
         "regime": regime,
         "ultimo_concurso": regime.get("ultimo_concurso") if isinstance(regime, dict) else None,
     }
 
-
-def _v1_run(k: int, max_candidatos: int) -> List[Any]:
+    # Grupo de Milhões (amostragem)
     grupo = GrupoMilhoes()
     candidatos = grupo.get_candidatos(
-        k=k,
-        max_candidatos=max_candidatos,
+        k=req.k,
+        max_candidatos=req.max_candidatos,
         shuffle=True,
         seed=1337,
     )
     if not candidatos:
-        raise HTTPException(status_code=500, detail="Grupo de Milhões vazio.")
+        raise HTTPException(status_code=500, detail="Grupo de Milhões vazio")
+
+    # =========================
+    # v1 — FILTRO (mantém)
+    # =========================
     motor_v1 = MotorFGI()
     filtrados = motor_v1.gerar_prototipos(
         candidatos=candidatos,
-        top_n=max_candidatos,
+        top_n=req.max_candidatos,
     )
-    if not filtrados:
-        raise HTTPException(status_code=500, detail="V1 retornou vazio.")
-    return filtrados
 
+    if engine == "v1":
+        return {
+            "engine_used": "v1",
+            "prototipos": filtrados[: req.top_n],
+            "contexto_lab": contexto_lab,
+        }
 
-def _v2_run(
-    seqs_filtradas: List[List[int]],
-    contexto_lab: Dict[str, Any],
-    req: PrototiposRequest,
-) -> Dict[str, Any]:
+    seqs_filtradas = _extract_seq_list(filtrados)
+    if not seqs_filtradas:
+        raise HTTPException(status_code=500, detail="V1 não gerou sequências filtradas.")
+
+    # =========================
+    # v2 — SCF (re-ranking)
+    # =========================
     overrides_v2: Dict[str, Any] = {
         "top_n": req.top_n,
         "max_candidatos": req.max_candidatos,
@@ -285,16 +280,16 @@ def _v2_run(
         overrides=overrides_v2,
     )
 
-    resultado_v2 = _normalize_v2_result(resultado_v2)
-    resultado_v2["contexto_lab"] = contexto_lab
-    return resultado_v2
+    if engine == "v2":
+        if isinstance(resultado_v2, dict):
+            resultado_v2["contexto_lab"] = contexto_lab
+        return resultado_v2
 
+    # =========================
+    # v3 — CONTRASTE (rank final)
+    # =========================
+    candidatos_v3 = _extract_candidates_for_v3(resultado_v2)
 
-def _v3_run(
-    candidatos_v3: List[Dict[str, Any]],
-    contexto_lab: Dict[str, Any],
-    req: PrototiposRequest,
-) -> Dict[str, Any]:
     motor_v3 = MotorFGI_V3()
     resultado_v3 = motor_v3.rank(
         candidatos=candidatos_v3,
@@ -304,63 +299,7 @@ def _v3_run(
         gamma_base=req.gamma_base,
         jaccard_penalty_threshold=req.jaccard_penalty_threshold,
     )
+
     if isinstance(resultado_v3, dict):
         resultado_v3["contexto_lab"] = contexto_lab
-    return resultado_v3
-
-
-# ==============================
-# PROTÓTIPOS (pipeline obrigatório)
-# ==============================
-@app.post("/prototipos")
-def gerar_prototipos(req: PrototiposRequest):
-    engine = (req.engine or "").lower().strip()
-    if engine not in ("v1", "v2", "v3"):
-        raise HTTPException(status_code=400, detail="engine deve ser 'v1', 'v2' ou 'v3'.")
-
-    if req.k <= 0:
-        raise HTTPException(status_code=400, detail="k inválido.")
-
-    if req.top_n <= 0:
-        raise HTTPException(status_code=400, detail="top_n inválido.")
-
-    if req.max_candidatos <= 0:
-        raise HTTPException(status_code=400, detail="max_candidatos inválido.")
-
-    try:
-        # contexto
-        contexto_lab = _build_contexto_lab()
-
-        # v1 sempre roda (fonte das sequências)
-        filtrados = _v1_run(k=req.k, max_candidatos=req.max_candidatos)
-
-        if engine == "v1":
-            return {
-                "engine_used": "v1",
-                "prototipos": filtrados[: req.top_n],
-                "contexto_lab": contexto_lab,
-            }
-
-        # prepara input do v2
-        seqs_filtradas = _extract_seq_list(filtrados)
-        if not seqs_filtradas:
-            raise HTTPException(status_code=500, detail="Falha ao extrair sequências após V1.")
-
-        # v2 sempre roda quando engine != v1
-        resultado_v2 = _v2_run(seqs_filtradas=seqs_filtradas, contexto_lab=contexto_lab, req=req)
-
-        if engine == "v2":
-            return resultado_v2
-
-        # v3 depende de métricas do v2 (contrato)
-        candidatos_v3 = _extract_candidates_for_v3(resultado_v2)
-        resultado_v3 = _v3_run(candidatos_v3=candidatos_v3, contexto_lab=contexto_lab, req=req)
-
-        return JSONResponse(content=resultado_v3)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        # 500 com causa explícita (sem “Internal Server Error” cego)
-        raise HTTPException(status_code=500, detail=f"Falha interna em /prototipos: {type(e).__name__}: {e}")
-```0
+    return JSONResponse(content=resultado_v3)
