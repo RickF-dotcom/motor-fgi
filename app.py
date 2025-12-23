@@ -1,143 +1,116 @@
 # app.py
 import os
-import yaml
-from typing import List, Optional, Dict, Any
+import traceback
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
+import yaml
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field
 
-from fgi_engine import MotorFGI              # v1 (congelado)
-from fgi_engine_v2 import MotorFGI_V2        # v2 (SCF)
-from fgi_engine_v3 import MotorFGI_V3        # v3 (DCR/Contraste)
+from fgi_engine import MotorFGI                 # v1
+from fgi_engine_v2 import MotorFGI_V2           # v2
+from fgi_engine_v3 import MotorFGI_V3           # v3
 
 from grupo_de_milhoes import GrupoMilhoes
 from regime_detector import RegimeDetector
 
 
-# =========================================================
+# =========================
 # Build identity (Render)
-# =========================================================
+# =========================
 BUILD_COMMIT = os.environ.get("RENDER_GIT_COMMIT", "unknown")
 SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "unknown")
 
+# Liga debug de erro detalhado (sem precisar mexer em código depois)
+DEBUG_ERRORS = os.environ.get("DEBUG_ERRORS", "1") == "1"
 
-# =========================================================
-# App
-# =========================================================
+BASE_DIR = Path(__file__).resolve().parent
+DNA_FILE = BASE_DIR / "dna_last25.yaml"
+LAB_CONFIG_FILE = BASE_DIR / "lab_config.yaml"
+
+
+# =========================
+# Helpers
+# =========================
+def _read_yaml(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Arquivo não encontrado: {path.name} (path={path})")
+    with path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"YAML inválido: {path.name} não retornou dict.")
+    return data
+
+
+def _trace_short() -> str:
+    tb = traceback.format_exc()
+    lines = tb.strip().splitlines()
+    # pega só o final (o que importa)
+    return "\n".join(lines[-25:])
+
+
+def _fail(where: str, e: Exception) -> None:
+    # Loga no Render (para ver nos logs)
+    print(f"[ERROR] {where}: {repr(e)}")
+    if DEBUG_ERRORS:
+        print(_trace_short())
+    # Sobe como HTTPException com detalhe útil
+    detail = {
+        "where": where,
+        "error": str(e),
+    }
+    if DEBUG_ERRORS:
+        detail["trace"] = _trace_short()
+    raise HTTPException(status_code=500, detail=detail)
+
+
+# =========================
+# FastAPI
+# =========================
 app = FastAPI(
     title="ATHENA LABORATORIO PMF",
-    version="1.3.1",
+    version="1.3.0",
 )
 
 
-# =========================================================
-# Request Model (contrato real)
-# - aceita campos extras sem quebrar (para Swagger / evoluções)
-# =========================================================
+# =========================
+# Request Model (contrato)
+# =========================
 class PrototiposRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    # engine obrigatório
+    engine: str = Field(..., description="v1 | v2 | v3")
 
-    # engine: v1 | v2 | v3
-    engine: str = Field("v1", description="v1 | v2 | v3")
-
-    # tamanho da combinação
+    # tamanho da combinação (default 15)
     k: int = 15
 
-    # resposta final
+    # quantos retornos finais
     top_n: int = 10
 
-    # triagem inicial no grupo (performance)
+    # limita candidatos gerados/amostrados
     max_candidatos: int = 800
 
-    # V2/V3 (podem vir ou não)
+    # V2 parâmetros SCF (opcionais)
     windows: Optional[List[int]] = None
     dna_anchor_window: Optional[int] = None
     pesos_windows: Optional[Dict[str, float]] = None
     pesos_metricas: Optional[Dict[str, float]] = None
-
-    # redundância / diversidade
-    redundancy_jaccard_threshold: Optional[float] = None
+    redundancia_jaccard_threshold: Optional[float] = None
     redundancy_penalty: Optional[float] = None
-
-    # V2: cap e alinhamento
     z_cap: Optional[float] = None
     align_temperature: Optional[float] = None
 
-    # V3 knobs (aceitos, mas hoje não são obrigatórios)
-    alpha_contraste: Optional[float] = None
-    beta_diversidade: Optional[float] = None
-    gamma_base: Optional[float] = None
-    jaccard_penalty_threshold: Optional[float] = None
+    # V3 parâmetros DCR (defaults no request)
+    alpha_contraste: float = 0.55
+    beta_diversidade: float = 0.30
+    gamma_base: float = 0.15
+    jaccard_penalty_threshold: float = 0.75
 
 
-# =========================================================
-# Helpers: carregar YAML
-# =========================================================
-def _load_yaml(path: str) -> Dict[str, Any]:
-    if not os.path.exists(path):
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    return data if isinstance(data, dict) else {}
-
-
-def _contexto_lab() -> Dict[str, Any]:
-    dna = _load_yaml("dna_last25.yaml")
-    lab_cfg = _load_yaml("lab_config.yaml")
-    return {
-        "dna_last25": dna or {},
-        "lab_config": lab_cfg or {},
-    }
-
-
-# =========================================================
-# Helpers: normalizar payload para V2
-# (V3 depende do contrato do V2; então V3 sempre executa V2 primeiro)
-# =========================================================
-def _normalize_v2_overrides(req: PrototiposRequest) -> Dict[str, Any]:
-    # defaults estáveis
-    overrides: Dict[str, Any] = {
-        "top_n": int(req.top_n),
-        "windows": req.windows if req.windows else [7, 10, 12, 15, 25],
-        "dna_anchor_window": int(req.dna_anchor_window) if req.dna_anchor_window else 25,
-        "redundancy_jaccard_threshold": float(req.redundancy_jaccard_threshold) if req.redundancy_jaccard_threshold is not None else 0.75,
-        "redundancy_penalty": float(req.redundancy_penalty) if req.redundancy_penalty is not None else 0.25,
-        "z_cap": float(req.z_cap) if req.z_cap is not None else 3.0,
-        "align_temperature": float(req.align_temperature) if req.align_temperature is not None else 1.0,
-    }
-
-    # pesos opcionais
-    if isinstance(req.pesos_windows, dict) and req.pesos_windows:
-        overrides["pesos_windows"] = {str(k): float(v) for k, v in req.pesos_windows.items()}
-
-    if isinstance(req.pesos_metricas, dict) and req.pesos_metricas:
-        overrides["pesos_metricas"] = {str(k): float(v) for k, v in req.pesos_metricas.items()}
-
-    return overrides
-
-
-# =========================================================
-# Core: extrair candidatos do Grupo de Milhões
-# =========================================================
-def _extract_candidates(k: int, max_candidatos: int) -> List[List[int]]:
-    gm = GrupoMilhoes()
-    # contrato esperado: gm deve fornecer candidatos possíveis (não sorteados)
-    # tentativas de compatibilidade:
-    if hasattr(gm, "sample"):
-        return gm.sample(k=k, n=max_candidatos)
-    if hasattr(gm, "amostrar"):
-        return gm.amostrar(k=k, n=max_candidatos)
-    if hasattr(gm, "candidatos"):
-        return gm.candidatos(k=k, n=max_candidatos)
-    if hasattr(gm, "gerar"):
-        return gm.gerar(k=k, n=max_candidatos)
-    raise RuntimeError("GrupoMilhoes nao expõe método de amostragem (sample/amostrar/candidatos/gerar)")
-
-
-# =========================================================
-# Endpoints básicos
-# =========================================================
+# =========================
+# Health / Root / Status
+# =========================
 @app.get("/")
 def root():
     return {
@@ -148,7 +121,6 @@ def root():
         "docs": "/docs",
         "openapi": "/openapi.json",
         "endpoints": [
-            "/health",
             "/lab/status",
             "/lab/dna_last25",
             "/lab/regime_atual",
@@ -174,104 +146,127 @@ def lab_status():
             "v2": "Direcional / SCF",
             "v3": "Contraste / DCR",
         },
+        "debug_errors": DEBUG_ERRORS,
     }
 
 
 @app.get("/lab/dna_last25")
 def dna_last25():
-    ctx = _contexto_lab()
-    return ctx.get("dna_last25", {})
+    try:
+        dna = _read_yaml(DNA_FILE)
+        return {"ok": True, "dna_last25": dna}
+    except Exception as e:
+        _fail("GET /lab/dna_last25", e)
 
 
 @app.get("/lab/regime_atual")
 def regime_atual():
-    ctx = _contexto_lab()
-    det = RegimeDetector()
-    # compat: detect / detectar
-    if hasattr(det, "detect"):
-        return det.detect(ctx)
-    if hasattr(det, "detectar"):
-        return det.detectar(ctx)
-    return {"status": "regime_detector_sem_metodo"}
+    try:
+        dna = _read_yaml(DNA_FILE)
+        detector = RegimeDetector()
+        regime = detector.detectar_regime(dna)
+        return {"ok": True, "regime": regime}
+    except Exception as e:
+        _fail("GET /lab/regime_atual", e)
 
 
-# =========================================================
-# Engine runners
-# =========================================================
-def _v1_run(candidatos: List[List[int]], req: PrototiposRequest) -> Dict[str, Any]:
-    motor = MotorFGI()
-    # compat: gerar_prototipos / prototipos / run
-    if hasattr(motor, "gerar_prototipos"):
-        protos = motor.gerar_prototipos(candidatos, top_n=req.top_n)
-    elif hasattr(motor, "prototipos"):
-        protos = motor.prototipos(candidatos, top_n=req.top_n)
-    elif hasattr(motor, "run"):
-        protos = motor.run(candidatos, top_n=req.top_n)
-    else:
-        # fallback: só devolve as primeiras
-        protos = candidatos[: req.top_n]
-
-    return {"engine_used": "v1", "prototipos": protos}
-
-
-def _v2_run(candidatos: List[List[int]], req: PrototiposRequest) -> Dict[str, Any]:
-    motor = MotorFGI_V2()
-    ctx = _contexto_lab()
-    overrides = _normalize_v2_overrides(req)
-    return motor.rerank(candidatos=candidatos, contexto_lab=ctx, overrides=overrides)
-
-
-def _v3_run(candidatos: List[List[int]], req: PrototiposRequest) -> Dict[str, Any]:
-    # V3 SEMPRE roda V2 primeiro (contrato)
-    v2_out = _v2_run(candidatos, req)
-
-    # v2_out pode ter "top" ou outra chave — blindagem
-    candidatos_v2 = v2_out.get("top")
-    if not isinstance(candidatos_v2, list) or not candidatos_v2:
-        # tenta caminhos alternativos
-        candidatos_v2 = v2_out.get("candidatos_v2") or v2_out.get("resultados") or []
-    if not isinstance(candidatos_v2, list):
-        candidatos_v2 = []
-
-    motor = MotorFGI_V3()
-    v3_out = motor.rerank(candidatos_v2=candidatos_v2, overrides={"top_n": int(req.top_n)})
-
-    # anexa rastreabilidade mínima
-    v3_out["trace"] = {
-        "v2_engine_used": v2_out.get("engine_used", "v2"),
-        "v2_schema": v2_out.get("schema_version", None),
-        "input_candidates": len(candidatos),
-        "v2_items": len(candidatos_v2),
-    }
-    return v3_out
-
-
-# =========================================================
-# Endpoint principal
-# =========================================================
+# =========================
+# Core: gerar protótipos
+# =========================
 @app.post("/prototipos")
 def gerar_prototipos(req: PrototiposRequest):
     try:
-        candidatos = _extract_candidates(k=int(req.k), max_candidatos=int(req.max_candidatos))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"falha_extract_candidates: {e}")
+        # contexto do laboratório (sempre carregado do dna_last25.yaml)
+        dna = _read_yaml(DNA_FILE)
+        contexto_lab: Dict[str, Any] = {"dna_last25": dna}
 
-    engine = (req.engine or "v1").lower().strip()
+        # carrega config opcional do lab (se existir)
+        if LAB_CONFIG_FILE.exists():
+            contexto_lab["lab_config"] = _read_yaml(LAB_CONFIG_FILE)
 
-    try:
+        # gera candidatos (Grupo de Milhões)
+        grupo = GrupoMilhoes()
+        candidatos: List[List[int]] = grupo.gerar_candidatos(
+            k=req.k,
+            max_candidatos=req.max_candidatos,
+        )
+
+        engine = (req.engine or "").strip().lower()
+
+        # v1
         if engine == "v1":
-            return JSONResponse(content=_v1_run(candidatos, req))
+            motor = MotorFGI()
+            protos = motor.gerar_prototipos(
+                candidatos=candidatos,
+                top_n=req.top_n,
+                contexto_lab=contexto_lab,
+            )
+            return {"engine_used": "v1", "prototipos": protos, "contexto_lab": contexto_lab}
 
+        # v2
         if engine == "v2":
-            return JSONResponse(content=_v2_run(candidatos, req))
+            motor = MotorFGI_V2()
+            overrides: Dict[str, Any] = {
+                "top_n": req.top_n,
+                "windows": req.windows,
+                "dna_anchor_window": req.dna_anchor_window,
+                "pesos_windows": req.pesos_windows,
+                "pesos_metricas": req.pesos_metricas,
+                "redundancia_jaccard_threshold": req.redundancia_jaccard_threshold,
+                "redundancy_penalty": req.redundancy_penalty,
+                "z_cap": req.z_cap,
+                "align_temperature": req.align_temperature,
+            }
+            # remove Nones
+            overrides = {k: v for k, v in overrides.items() if v is not None}
 
+            out = motor.rerank(
+                candidatos=candidatos,
+                contexto_lab=contexto_lab,
+                overrides=overrides,
+            )
+            return {"engine_used": "v2", **out, "contexto_lab": contexto_lab}
+
+        # v3
         if engine == "v3":
-            return JSONResponse(content=_v3_run(candidatos, req))
+            motor = MotorFGI_V3()
+            overrides_v3: Dict[str, Any] = {
+                "top_n": req.top_n,
+                "alpha_contraste": req.alpha_contraste,
+                "beta_diversidade": req.beta_diversidade,
+                "gamma_base": req.gamma_base,
+                "jaccard_penalty_threshold": req.jaccard_penalty_threshold,
+            }
 
-        raise HTTPException(status_code=422, detail="engine inválido (use v1 | v2 | v3)")
+            out = motor.rerank(
+                candidatos=candidatos,
+                contexto_lab=contexto_lab,
+                overrides=overrides_v3,
+            )
+            return {"engine_used": "v3", **out, "contexto_lab": contexto_lab}
+
+        raise HTTPException(status_code=422, detail=f"engine inválido: {req.engine}. Use v1|v2|v3")
 
     except HTTPException:
         raise
     except Exception as e:
-        # aqui tem que virar 500 com detalhe (pra não ficar “Internal Server Error” cego)
-        raise HTTPException(status_code=500, detail=f"erro_no_engine_{engine}: {e}")
+        _fail("POST /prototipos", e)
+
+
+# =========================
+# Global exception handler (backup)
+# =========================
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request, exc: Exception):
+    # evita 500 “mudo”
+    print(f"[UNHANDLED] {request.method} {request.url}: {repr(exc)}")
+    if DEBUG_ERRORS:
+        print(_trace_short())
+    payload = {"detail": "Internal Server Error"}
+    if DEBUG_ERRORS:
+        payload = {
+            "detail": "Internal Server Error",
+            "error": str(exc),
+            "trace": _trace_short(),
+        }
+    return JSONResponse(status_code=500, content=payload)
