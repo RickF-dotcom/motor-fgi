@@ -156,7 +156,7 @@ class GrupoMilhoes:
 # Compatibilidade com o app.py atual (não quebrar pipeline)
 # ============================================================
 
-class GrupoMilhoes(GrupoDeMilhoes):
+class GrupoMilhoes:
     """
     Alias compatível com imports existentes:
       from grupo_de_milhoes import GrupoMilhoes
