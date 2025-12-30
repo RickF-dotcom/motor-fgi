@@ -1,87 +1,82 @@
-# grupo_de_milhoes.py
-from typing import List, Tuple, Iterable, Optional, Dict, Any
+from typing import List, Iterable, Set, Dict, Any
 import random
-import time
-
-Jogo = Tuple[int, ...]
 
 
-class GrupoDeMilhoes:
+class GrupoMilhoes:
     """
-    Representa o conjunto de todas as combinações NÃO sorteadas.
+    Baseline seguro do Grupo de Milhões.
+    Nenhuma dependência externa.
+    Nenhuma leitura de arquivo.
+    Nenhum efeito colateral no import.
     """
 
     def __init__(
         self,
-        jogos_drawn: Iterable[Jogo],
+        k: int = 15,
         min_n: int = 1,
         max_n: int = 25,
-        k: int = 15,
-        seed: Optional[int] = None,
+        seed: int | None = None
     ):
+        self.k = k
+        self.min_n = min_n
+        self.max_n = max_n
+        self.seed = seed
         if seed is not None:
             random.seed(seed)
 
-        self.min_n = min_n
-        self.max_n = max_n
-        self.k = k
-        self._drawn = set(tuple(sorted(j)) for j in jogos_drawn)
+        self._drawn: Set[tuple[int, ...]] = set()
+
+    # -------------------------
+    # Núcleo
+    # -------------------------
 
     def is_drawn(self, jogo: Iterable[int]) -> bool:
-        return tuple(sorted(jogo)) in self._drawn
+        key = tuple(sorted(jogo))
+        return key in self._drawn
+
+    def add_drawn(self, jogo: Iterable[int]) -> None:
+        key = tuple(sorted(jogo))
+        if len(key) != self.k:
+            raise ValueError("Jogo inválido: tamanho incorreto")
+        self._drawn.add(key)
 
     def random_game(self) -> List[int]:
-        return sorted(random.sample(range(self.min_n, self.max_n + 1), self.k))
+        nums = random.sample(range(self.min_n, self.max_n + 1), self.k)
+        return sorted(nums)
 
-    def sample_not_drawn(
-        self,
-        n: int = 10,
-        timeout_sec: float = 2.0,
-        max_attempts_factor: int = 20,
-    ) -> Dict[str, Any]:
+    def generate_not_drawn(self, n: int = 10) -> Dict[str, Any]:
         """
-        Gera jogos aleatórios NÃO sorteados (protótipos).
+        Gera jogos aleatórios que NÃO estejam marcados como sorteados.
         """
-        start = time.time()
-        results = []
-        seen = set()
+        results: List[List[int]] = []
         attempts = 0
-        max_attempts = n * max_attempts_factor
+        max_attempts = n * 20
 
-        while len(results) < n:
-            if attempts >= max_attempts:
-                break
-            if time.time() - start > timeout_sec:
-                break
-
+        while len(results) < n and attempts < max_attempts:
             attempts += 1
-            jogo = tuple(self.random_game())
-
-            if jogo in seen:
-                continue
-
-            seen.add(jogo)
-
+            jogo = self.random_game()
             if not self.is_drawn(jogo):
-                results.append(list(jogo))
+                results.append(jogo)
 
         return {
-            "count": len(results),
             "requested": n,
+            "generated": len(results),
             "attempts": attempts,
-            "elapsed_ms": int((time.time() - start) * 1000),
-            "prototipos": results,
-            "drawn_size": len(self._drawn),
+            "games": results,
         }
+
+    # -------------------------
+    # Status
+    # -------------------------
 
     def status(self) -> Dict[str, Any]:
         return {
             "k": self.k,
             "range": [self.min_n, self.max_n],
             "drawn_size": len(self._drawn),
+            "seed": self.seed,
         }
-# --- ALIAS de compatibilidade (não remover) ---
-GrupoDeMilhoes = GrupoMilhoes
+
 
 # Alias de compatibilidade (evita NameError em imports antigos)
-GrupoMilhoes = GrupoDeMilhoes
+GrupoDeMilhoes = GrupoMilhoes
