@@ -80,7 +80,8 @@ class GrupoDeMilhoes:
             "range": [self.min_n, self.max_n],
             "drawn_size": len(self._drawn),
         }
-
+# --- ALIAS de compatibilidade (não remover) ---
+GrupoDeMilhoes = GrupoMilhoes
 
 # Alias de compatibilidade (evita NameError em imports antigos)
 GrupoMilhoes = GrupoDeMilhoes
