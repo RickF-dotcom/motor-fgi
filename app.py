@@ -1,7 +1,8 @@
 # app.py
 import os
+import csv
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Iterable, Tuple
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -36,10 +37,162 @@ except Exception:
         GrupoClass = None
 
 
+# ==========================================================
+# Helpers: localizar e carregar histórico automaticamente
+# ==========================================================
+def _repo_root() -> Path:
+    # Render roda em /app normalmente
+    # mas isso mantém compatível localmente também
+    here = Path(__file__).resolve()
+    return here.parent
+
+
+def _candidate_history_paths() -> List[Path]:
+    # 1) ENV explícita (prioridade máxima)
+    env = os.environ.get("HISTORICO_CSV", "").strip()
+    paths: List[Path] = []
+    if env:
+        paths.append(Path(env))
+
+    # 2) nomes prováveis no repo (fallback automático)
+    root = _repo_root()
+    paths += [
+        root / "lotofacil_ultimos_25_concursos.csv",
+        root / "lotofacil_ultimos_25_concursos.CSV",
+        root / "historico_lotofacil.csv",
+        root / "historico.csv",
+    ]
+    return paths
+
+
+def _find_history_csv() -> Optional[Path]:
+    for p in _candidate_history_paths():
+        try:
+            if p.exists() and p.is_file():
+                return p
+        except Exception:
+            continue
+    return None
+
+
+def _parse_history_csv(path: Path, universo_max: int = 25) -> List[List[int]]:
+    """
+    Parser robusto:
+    - aceita CSV com colunas diversas
+    - extrai todos os inteiros 1..universo_max por linha
+    - retorna lista de jogos (listas ordenadas)
+    """
+    jogos: List[List[int]] = []
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            nums: List[int] = []
+            for cell in row:
+                cell = (cell or "").strip()
+                if not cell:
+                    continue
+                # quebra por separadores comuns
+                parts = (
+                    cell.replace(";", " ")
+                        .replace("-", " ")
+                        .replace(",", " ")
+                        .replace("\t", " ")
+                        .split()
+                )
+                for part in parts:
+                    try:
+                        n = int(part)
+                    except Exception:
+                        continue
+                    if 1 <= n <= universo_max:
+                        nums.append(n)
+            if nums:
+                uniq = sorted(set(nums))
+                # só aceita jogos com tamanho mínimo plausível
+                if len(uniq) >= 10:  # lotofácil geralmente >= 15; aqui é tolerante
+                    jogos.append(uniq)
+    return jogos
+
+
+def _inject_history_into_grupo(grupo: Any, universo_max: int = 25) -> Dict[str, Any]:
+    """
+    Carrega histórico no Grupo SEM depender da interface da classe.
+    Preferência:
+    - se existir grupo.load_from_csv(path) -> usa
+    - senão: parseia CSV e injeta em grupo.drawn (set de tuplas)
+    """
+    info: Dict[str, Any] = {
+        "history_loaded": False,
+        "history_path": None,
+        "history_games": 0,
+        "history_mode": None,
+        "drawn_size": None,
+        "error": None,
+    }
+
+    path = _find_history_csv()
+    if not path:
+        # sem histórico, não quebra nada
+        try:
+            if hasattr(grupo, "drawn"):
+                info["drawn_size"] = len(getattr(grupo, "drawn"))
+        except Exception:
+            info["drawn_size"] = None
+        return info
+
+    info["history_path"] = str(path)
+
+    try:
+        # 1) se a classe tiver loader próprio
+        if hasattr(grupo, "load_from_csv") and callable(getattr(grupo, "load_from_csv")):
+            grupo.load_from_csv(path)  # type: ignore
+            info["history_loaded"] = True
+            info["history_mode"] = "grupo.load_from_csv"
+        else:
+            # 2) fallback universal: injeta em grupo.drawn
+            jogos = _parse_history_csv(path, universo_max=universo_max)
+            if not hasattr(grupo, "drawn"):
+                raise RuntimeError("Classe do Grupo não expõe atributo 'drawn' e não tem load_from_csv().")
+
+            drawn = getattr(grupo, "drawn")
+            if not isinstance(drawn, set):
+                raise RuntimeError("Atributo 'drawn' existe, mas não é set().")
+
+            before = len(drawn)
+            for j in jogos:
+                drawn.add(tuple(sorted(j)))
+            after = len(drawn)
+
+            info["history_loaded"] = True
+            info["history_mode"] = "inject_into_grupo.drawn"
+            info["history_games"] = len(jogos)
+            info["drawn_size"] = after
+            # se nada entrou, ainda assim marcamos o caminho
+            if after == before:
+                info["history_mode"] += "_no_change"
+        # pós
+        try:
+            if hasattr(grupo, "drawn"):
+                info["drawn_size"] = len(getattr(grupo, "drawn"))
+        except Exception:
+            pass
+
+        return info
+
+    except Exception as e:
+        info["error"] = str(e)
+        try:
+            if hasattr(grupo, "drawn"):
+                info["drawn_size"] = len(getattr(grupo, "drawn"))
+        except Exception:
+            pass
+        return info
+
+
 def _make_grupo() -> Any:
     """
     Cria instância do Grupo de Milhões SEM exigir histórico.
-    Se existir CSV configurado, carrega.
+    Se existir CSV no repo (ou configurado), carrega automaticamente.
     """
     if GrupoClass is None:
         raise HTTPException(
@@ -47,29 +200,25 @@ def _make_grupo() -> Any:
             detail="Não consegui importar GrupoMilhoes/GrupoDeMilhoes de grupo_de_milhoes.py",
         )
 
-    # opcional: path do histórico (se você quiser usar)
-    historico_csv = os.environ.get("HISTORICO_CSV", "").strip()
     universo_max = int(os.environ.get("UNIVERSO_MAX", "25"))
-
     kwargs: Dict[str, Any] = {}
 
-    # compatibilidade: alguns construtores usam (universo_max, historico_csv)
-    # outros podem não aceitar historico_csv
+    # compatibilidade: alguns construtores usam universo_max
     kwargs["universo_max"] = universo_max
 
-    if historico_csv:
-        p = Path(historico_csv)
-        if p.exists():
-            kwargs["historico_csv"] = p
-
+    # tenta instanciar com kwargs; se falhar, tenta vazio
     try:
-        return GrupoClass(**kwargs)
+        grupo = GrupoClass(**kwargs)
     except TypeError:
-        # fallback mínimo: tenta sem kwargs
         try:
-            return GrupoClass()
+            grupo = GrupoClass()
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Falha ao instanciar Grupo: {e}")
+
+    # injeta histórico se achar CSV (não quebra se não achar)
+    _inject_history_into_grupo(grupo, universo_max=universo_max)
+
+    return grupo
 
 
 # ==========================================================
@@ -156,7 +305,8 @@ def lab_status():
             "enabled": True,
             "class": getattr(GrupoClass, "__name__", "unknown"),
             "universo_max": int(os.environ.get("UNIVERSO_MAX", "25")),
-            "historico_csv": os.environ.get("HISTORICO_CSV", "").strip() or None,
+            "historico_csv_env": os.environ.get("HISTORICO_CSV", "").strip() or None,
+            "historico_csv_auto": str(_find_history_csv()) if _find_history_csv() else None,
         },
     }
 
@@ -185,20 +335,29 @@ def grupo_status():
     Prova de integração:
     - importa
     - instancia
-    - responde com informações mínimas
+    - carrega histórico (se achar CSV)
+    - responde com informações mínimas + drawn_size
     """
+    universo_max = int(os.environ.get("UNIVERSO_MAX", "25"))
     grupo = _make_grupo()
+    hist_info = _inject_history_into_grupo(grupo, universo_max=universo_max)
 
     payload: Dict[str, Any] = {
         "ok": True,
         "class": getattr(grupo, "__class__", type("x", (), {})).__name__,
-        "universo_max": getattr(grupo, "universo_max", None),
-        "historico_csv": os.environ.get("HISTORICO_CSV", "").strip() or None,
+        "universo_max": getattr(grupo, "universo_max", universo_max),
+        "historico_csv_env": os.environ.get("HISTORICO_CSV", "").strip() or None,
+        "historico_csv_auto": str(_find_history_csv()) if _find_history_csv() else None,
+        "drawn_size": hist_info.get("drawn_size"),
+        "history_loaded": hist_info.get("history_loaded"),
+        "history_mode": hist_info.get("history_mode"),
+        "history_games": hist_info.get("history_games"),
+        "history_error": hist_info.get("error"),
         "build_commit": BUILD_COMMIT,
         "service_id": SERVICE_ID,
     }
 
-    # se existir método total_sorteadas (no seu GrupoDeMilhoes tem)
+    # se existir método total_sorteadas (em algumas versões)
     try:
         if hasattr(grupo, "total_sorteadas"):
             payload["total_sorteadas_k15"] = grupo.total_sorteadas(15)  # type: ignore
